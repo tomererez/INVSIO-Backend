@@ -6,6 +6,8 @@ const llmExplainer = require('./llmExplainer');
 const stateStorage = require('./stateStorage');
 // Stage 2: Outcome Labeling
 const outcomeLabeler = require('./outcomeLabeler');
+// Phase 6: Absorption Logic
+const absorptionService = require('./absorptionService');
 
 module.exports = {
   marketDataService,
@@ -14,5 +16,7 @@ module.exports = {
   llmExplainer,
   stateStorage,
   // Stage 2
-  outcomeLabeler
+  outcomeLabeler,
+  // Phase 6
+  absorptionService
 };

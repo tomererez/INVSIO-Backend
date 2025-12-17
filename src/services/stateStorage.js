@@ -104,6 +104,48 @@ function cleanupDedupCache() {
     }
 }
 
+/**
+ * Hydrate the deduplication cache from recent database history.
+ * Should be called on server startup.
+ */
+async function hydrateDedupCache(symbol = 'BTC') {
+    const client = getSupabase();
+    if (!client) return { success: false, error: 'Supabase not configured' };
+
+    // Look back at least as long as our retention period
+    const lookbackMs = DEDUP_CONFIG.cacheRetentionMs || (60 * 60 * 1000);
+    const fromDate = Date.now() - lookbackMs;
+
+    try {
+        const { data, error } = await client
+            .from('market_states')
+            .select('id, timestamp')
+            .eq('symbol', symbol)
+            .gte('timestamp', fromDate)
+            .order('timestamp', { ascending: false });
+
+        if (error) {
+            console.error('❌ Error hydrating dedup cache:', error);
+            return { success: false, error: error.message };
+        }
+
+        let count = 0;
+        if (data && data.length > 0) {
+            data.forEach(row => {
+                const timeBucket = getTimeBucket(row.timestamp);
+                recordDedupSave(symbol, timeBucket, row.id);
+                count++;
+            });
+        }
+
+        console.log(`✅ Dedup cache hydrated: ${count} entries`);
+        return { success: true, count };
+    } catch (err) {
+        console.error('❌ Exception hydrating dedup cache:', err);
+        return { success: false, error: err.message };
+    }
+}
+
 // Initialize Supabase client
 let supabase = null;
 
@@ -153,62 +195,37 @@ async function saveMarketState(marketState, options = {}) {
 
     const id = uuidv4();
 
-    // Extract key fields from market state
+    // Extract ONLY the minimal flat columns needed for indexing/queries
+    // Everything else lives in full_state_json (SINGLE SOURCE OF TRUTH)
     const decision = marketState.finalDecision || {};
-    const exchange = marketState.exchangeDivergence || {};
     const regime = marketState.marketRegime || {};
     const raw = marketState.raw || {};
     const binance4h = raw.binance?.['4h'] || {};
-    const bybit4h = raw.bybit?.['4h'] || {};
-
-    // Stage 2: Extract timeframe buckets for hierarchy validation
-    const buckets = marketState.timeframeBuckets || {};
-    const macroBucket = buckets.macro || {};
-    const microBucket = buckets.micro || {};
-    const scalpingBucket = buckets.scalping || {};
 
     const record = {
         id,
+        // =========================================================================
+        // IDENTITY
+        // =========================================================================
         timestamp,
         symbol: 'BTC',
-        timeframe: marketState.timeframe || '4h',
+
+        // =========================================================================
+        // MINIMAL FLAT COLUMNS (for indexing & fast queries only)
+        // =========================================================================
         bias: decision.bias || null,
         confidence: decision.confidence || null,
-        trade_stance: decision.tradeStance || null,
         primary_regime: decision.primaryRegime || regime.regime || null,
-        risk_mode: decision.riskMode || null,
-        exchange_scenario: exchange.scenario || null,
-        binance_oi_change: exchange.binance?.oi_change || binance4h.oi_change || null,
-        bybit_oi_change: exchange.bybit?.oi_change || bybit4h.oi_change || null,
-        binance_cvd: exchange.binance?.cvd_billions || null,
-        bybit_cvd: exchange.bybit?.cvd_billions || null,
-        regime_state: regime.regime || null,
-        regime_subtype: regime.subType || null,
-        funding_rate: binance4h.funding_rate_avg_pct || null,
         price: binance4h.price || null,
-        // Store as native JSON object, not stringified - enables introspection
+
+        // =========================================================================
+        // SINGLE SOURCE OF TRUTH - all analyzer fields live here
+        // =========================================================================
         full_state_json: marketState,
-        created_at: new Date().toISOString(),
 
-        // =====================================================================
-        // STAGE 2: HIERARCHY VALIDATION FIELDS
-        // =====================================================================
-        // These capture the three-layer hierarchy state for later validation
-
-        macro_bias: macroBucket.bias || null,
-        macro_confidence: macroBucket.confidence || null,
-        micro_bias: microBucket.bias || null,
-        micro_confidence: microBucket.confidence || null,
-        scalping_bias: scalpingBucket.bias || null,
-        scalping_confidence: scalpingBucket.confidence || null,
-        // Was macro anchoring applied?
-        macro_anchored: decision.macroAnchored || false,
-        // Was there a hierarchy warning?
-        hierarchy_warning: decision.warning || null,
-
-        // =====================================================================
-        // STAGE 2: OUTCOME LABELING FIELDS (populated later by updateStateOutcome)
-        // =====================================================================
+        // =========================================================================
+        // OUTCOME LABELING (populated later by updateStateOutcome)
+        // =========================================================================
         outcome_label: null,
         outcome_reason: null,
         outcome_horizon: null,
@@ -216,7 +233,12 @@ async function saveMarketState(marketState, options = {}) {
         outcome_move_pct: null,
         outcome_mfe: null,
         outcome_mae: null,
-        outcome_labeled_at: null
+        outcome_labeled_at: null,
+
+        // =========================================================================
+        // METADATA
+        // =========================================================================
+        created_at: new Date().toISOString()
     };
 
     try {
@@ -249,12 +271,7 @@ async function getStateHistory(symbol = 'BTC', fromDate = null, toDate = null, l
     try {
         let query = client
             .from('market_states')
-            .select(`
-                id, timestamp, symbol, timeframe,
-                bias, confidence, trade_stance, primary_regime, risk_mode,
-                exchange_scenario, regime_state, regime_subtype,
-                price, funding_rate
-            `)
+            .select('*')
             .eq('symbol', symbol)
             .order('timestamp', { ascending: false })
             .limit(limit);
@@ -273,7 +290,17 @@ async function getStateHistory(symbol = 'BTC', fromDate = null, toDate = null, l
             return [];
         }
 
-        return data || [];
+        return (data || []).map(row => {
+            // Expand full_state_json to top level for backward compatibility
+            const fullState = row.full_state_json || {};
+            return {
+                ...fullState,
+                ...row,
+                full_state_json: undefined,
+                // Fallback for old schema if primary_regime is missing
+                primary_regime: row.primary_regime || row.regime_state || row.marketRegime?.regime || null
+            };
+        });
     } catch (error) {
         console.error('❌ Error getting state history:', error);
         return [];
@@ -603,6 +630,368 @@ async function getOutcomeStats(symbol = 'BTC', fromDate = null, toDate = null) {
 
 /**
  * =======================================================================
+ * STAGE 3: REPLAY STATE FUNCTIONS (separate table)
+ * =======================================================================
+ * These functions manage the replay_states table which is separate from
+ * the live market_states table for cleaner data separation.
+ */
+
+/**
+ * Save a replay state to the replay_states table.
+ * Uses MINIMAL columns - full_state_json is the SINGLE SOURCE OF TRUTH.
+ * This means future analyzer changes do NOT require DB migrations.
+ * 
+ * @param {Object} replayData - Replay-specific data
+ * @param {string} replayData.batchId - UUID of the batch
+ * @param {number} replayData.asOfTimestamp - The "as of" timestamp for this replay
+ * @param {string} replayData.symbol - Symbol (e.g., 'BTC')
+ * @param {Object} replayData.marketState - The generated market state (stored as JSONB)
+ * @param {Object} replayData.metadata - Additional metadata (status, errorMessage)
+ */
+async function saveReplayState(replayData) {
+    const client = getSupabase();
+    if (!client) return { success: false, error: 'Supabase not configured' };
+
+    const {
+        batchId,
+        asOfTimestamp,
+        symbol = 'BTC',
+        marketState,
+        metadata = {}
+    } = replayData;
+
+    if (!batchId || !asOfTimestamp) {
+        return { success: false, error: 'batchId and asOfTimestamp are required' };
+    }
+
+    if (!marketState) {
+        return { success: false, error: 'marketState is required' };
+    }
+
+    const id = uuidv4();
+
+    // Extract ONLY the minimal flat columns needed for indexing/filtering/scoreboard
+    // Everything else lives in full_state_json
+    const decision = marketState?.finalDecision || {};
+    const regime = marketState?.marketRegime || {};
+    const raw = marketState?.raw || {};
+
+    const record = {
+        id,
+        // =========================================================================
+        // REPLAY IDENTITY (required for idempotency)
+        // =========================================================================
+        batch_id: batchId,
+        as_of_timestamp: asOfTimestamp,
+        symbol,
+
+        // =========================================================================
+        // MINIMAL FLAT COLUMNS (for indexing & fast scoreboard queries only)
+        // =========================================================================
+        timestamp: marketState?.timestamp || asOfTimestamp,
+        bias: decision.bias || null,
+        confidence: decision.confidence || null,
+        primary_regime: decision.primaryRegime || regime.regime || null,
+        price: raw.binance?.['4h']?.price || null,
+
+        // =========================================================================
+        // SINGLE SOURCE OF TRUTH - all analyzer fields live here
+        // =========================================================================
+        full_state_json: marketState,
+
+        // =========================================================================
+        // STATUS & METADATA
+        // =========================================================================
+        status: metadata.status || 'COMPLETED',
+        error_message: metadata.errorMessage || null
+    };
+
+    try {
+        const { data, error } = await client
+            .from('replay_states')
+            .insert(record)
+            .select('id')
+            .single();
+
+        if (error) {
+            console.error('❌ Supabase saveReplayState error:', error);
+            return { success: false, error: error.message };
+        }
+
+        console.log(`✅ Replay state saved: ${id} for batch ${batchId}`);
+        return { success: true, id, batchId, asOfTimestamp };
+    } catch (error) {
+        console.error('❌ Error saving replay state:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Check if a replay state already exists (for idempotency).
+ * Uses the unique constraint: (batch_id, as_of_timestamp, symbol)
+ */
+async function checkExistingReplayState(batchId, asOfTimestamp, symbol = 'BTC') {
+    const client = getSupabase();
+    if (!client) return null;
+
+    try {
+        const { data, error } = await client
+            .from('replay_states')
+            .select('id, status')
+            .eq('batch_id', batchId)
+            .eq('as_of_timestamp', asOfTimestamp)
+            .eq('symbol', symbol)
+            .maybeSingle();
+
+        if (error) {
+            console.error('❌ Error checking existing replay state:', error);
+            return null;
+        }
+
+        return data;
+    } catch (error) {
+        console.error('❌ Error checking existing replay state:', error);
+        return null;
+    }
+}
+
+/**
+ * Get replay states for a batch.
+ * Returns minimal columns by default; full_state_json on request.
+ * Additional fields can be extracted from full_state_json client-side.
+ */
+async function getReplayStates(batchId, options = {}) {
+    const client = getSupabase();
+    if (!client) return [];
+
+    const { limit = 100, offset = 0, includeFullState = false } = options;
+
+    try {
+        // MINIMAL COLUMNS - everything else is in full_state_json
+        const columns = includeFullState
+            ? '*'
+            : `id, batch_id, as_of_timestamp, symbol, timestamp,
+               bias, confidence, primary_regime, price,
+               outcome_label, outcome_reason, outcome_horizon,
+               outcome_move_pct, outcome_mfe, outcome_mae, outcome_labeled_at,
+               status, error_message, created_at`;
+
+        const { data, error } = await client
+            .from('replay_states')
+            .select(columns)
+            .eq('batch_id', batchId)
+            .order('as_of_timestamp', { ascending: true })
+            .range(offset, offset + limit - 1);
+
+        if (error) {
+            console.error('❌ Supabase getReplayStates error:', error);
+            return [];
+        }
+
+        return data || [];
+    } catch (error) {
+        console.error('❌ Error getting replay states:', error);
+        return [];
+    }
+}
+
+/**
+ * Get all replay states (no batchId filter) for frontend hydration.
+ * Returns recent replay states ordered by timestamp descending.
+ */
+async function getAllReplayStates(options = {}) {
+    const client = getSupabase();
+    if (!client) return [];
+
+    const { limit = 100, symbol = 'BTC' } = options;
+
+    try {
+        const { data, error } = await client
+            .from('replay_states')
+            .select('*')
+            .eq('symbol', symbol)
+            .order('as_of_timestamp', { ascending: false })
+            .limit(limit);
+
+        if (error) {
+            console.error('❌ Supabase getAllReplayStates error:', error);
+            return [];
+        }
+
+        return data || [];
+    } catch (error) {
+        console.error('❌ Error getting all replay states:', error);
+        return [];
+    }
+}
+
+/**
+ * Get unlabeled replay states for outcome labeling.
+ */
+async function getUnlabeledReplayStates(options = {}) {
+    const client = getSupabase();
+    if (!client) return [];
+
+    const { batchId, symbol = 'BTC', maxAgeMs = 8 * 60 * 60 * 1000, limit = 100 } = options;
+    const cutoffTimestamp = Date.now() - maxAgeMs;
+
+    try {
+        let query = client
+            .from('replay_states')
+            .select('*')
+            .eq('symbol', symbol)
+            .eq('status', 'COMPLETED')
+            .is('outcome_label', null)
+            .lt('as_of_timestamp', cutoffTimestamp)
+            .order('as_of_timestamp', { ascending: true })
+            .limit(limit);
+
+        if (batchId) {
+            query = query.eq('batch_id', batchId);
+        }
+
+        const { data, error } = await query;
+
+        if (error) {
+            console.error('❌ Supabase getUnlabeledReplayStates error:', error);
+            return [];
+        }
+
+        // Parse full state JSON
+        return (data || []).map(row => {
+            let fullState = null;
+            if (row.full_state_json) {
+                fullState = typeof row.full_state_json === 'string'
+                    ? JSON.parse(row.full_state_json)
+                    : row.full_state_json;
+            }
+            return { ...row, full_state: fullState };
+        });
+    } catch (error) {
+        console.error('❌ Error getting unlabeled replay states:', error);
+        return [];
+    }
+}
+
+/**
+ * Update a replay state with outcome label.
+ */
+async function updateReplayStateOutcome(stateId, outcomeData) {
+    const client = getSupabase();
+    if (!client) return { success: false, error: 'Supabase not configured' };
+
+    const updateRecord = {
+        outcome_label: outcomeData.label,
+        outcome_reason: outcomeData.reason || null,
+        outcome_horizon: outcomeData.horizon || null,
+        outcome_price: outcomeData.finalPrice || null,
+        outcome_move_pct: outcomeData.finalMovePercent || null,
+        outcome_mfe: outcomeData.maxFavorableExcursion || null,
+        outcome_mae: outcomeData.maxAdverseExcursion || null,
+        outcome_labeled_at: Date.now()
+    };
+
+    try {
+        const { error } = await client
+            .from('replay_states')
+            .update(updateRecord)
+            .eq('id', stateId);
+
+        if (error) {
+            console.error('❌ Supabase updateReplayStateOutcome error:', error);
+            return { success: false, error: error.message };
+        }
+
+        return { success: true, stateId, label: outcomeData.label };
+    } catch (error) {
+        console.error('❌ Error updating replay state outcome:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Get replay outcome statistics.
+ * Uses only minimal columns for fast aggregation queries.
+ */
+async function getReplayOutcomeStats(options = {}) {
+    const client = getSupabase();
+    if (!client) return null;
+
+    const { batchId, symbol = 'BTC' } = options;
+
+    try {
+        // MINIMAL COLUMNS for scoreboard aggregation
+        let query = client
+            .from('replay_states')
+            .select('bias, confidence, outcome_label, outcome_move_pct, outcome_mfe, outcome_mae')
+            .eq('symbol', symbol)
+            .not('outcome_label', 'is', null);
+
+        if (batchId) {
+            query = query.eq('batch_id', batchId);
+        }
+
+        const { data, error } = await query;
+
+        if (error) {
+            console.error('❌ Supabase getReplayOutcomeStats error:', error);
+            return null;
+        }
+
+        if (!data || data.length === 0) {
+            return { total: 0, noData: true };
+        }
+
+        // Calculate statistics (same logic as getOutcomeStats)
+        const stats = {
+            total: data.length,
+            byLabel: { CONTINUATION: 0, REVERSAL: 0, NOISE: 0 },
+            byBias: {
+                LONG: { total: 0, correct: 0, accuracy: 0 },
+                SHORT: { total: 0, correct: 0, accuracy: 0 },
+                WAIT: { total: 0, correct: 0, accuracy: 0 }
+            },
+            directionalAccuracy: null
+        };
+
+        for (const row of data) {
+            const label = row.outcome_label;
+            const bias = row.bias;
+
+            if (stats.byLabel[label] !== undefined) stats.byLabel[label]++;
+
+            if (bias in stats.byBias) {
+                stats.byBias[bias].total++;
+                const isCorrect = (bias !== 'WAIT' && label === 'CONTINUATION') ||
+                    (bias === 'WAIT' && label === 'NOISE');
+                if (isCorrect) stats.byBias[bias].correct++;
+            }
+        }
+
+        // Calculate accuracy
+        for (const bias in stats.byBias) {
+            if (stats.byBias[bias].total > 0) {
+                stats.byBias[bias].accuracy = Number(
+                    ((stats.byBias[bias].correct / stats.byBias[bias].total) * 100).toFixed(1)
+                );
+            }
+        }
+
+        const totalDir = stats.byBias.LONG.total + stats.byBias.SHORT.total;
+        const correctDir = stats.byBias.LONG.correct + stats.byBias.SHORT.correct;
+        if (totalDir > 0) {
+            stats.directionalAccuracy = Number(((correctDir / totalDir) * 100).toFixed(1));
+        }
+
+        return stats;
+    } catch (error) {
+        console.error('❌ Error getting replay outcome stats:', error);
+        return null;
+    }
+}
+
+/**
+ * =======================================================================
  * ALERT PERSISTENCE FUNCTIONS
  * =======================================================================
  */
@@ -611,7 +1000,8 @@ async function saveAlert(alert, marketStateId = null) {
     const client = getSupabase();
     if (!client) return { success: false, error: 'Supabase not configured' };
 
-    const id = alert.id || uuidv4();
+    // Always generate UUID for database (column expects UUID format)
+    const id = uuidv4();
 
     const record = {
         id,
@@ -620,7 +1010,7 @@ async function saveAlert(alert, marketStateId = null) {
         priority: alert.priority || 'medium',
         title: alert.title || '',
         description: alert.description || '',
-        context_json: JSON.stringify(alert.context || {}),
+        context_json: JSON.stringify({ ...alert.context, originalAlertId: alert.id }),
         actionable_insight: alert.actionableInsight || '',
         market_state_id: marketStateId,
         acknowledged: false,
@@ -662,7 +1052,7 @@ async function getAlertHistory(fromDate = null, toDate = null, alertType = null,
             .from('alerts_history')
             .select(`
                 *,
-                market_states (bias, confidence, regime_state)
+                market_states (bias, confidence, primary_regime)
             `)
             .order('timestamp', { ascending: false })
             .limit(limit);
@@ -761,7 +1151,7 @@ async function getAggregatedStats(symbol = 'BTC', fromDate = null, toDate = null
         // Build filters
         let stateQuery = client
             .from('market_states')
-            .select('bias, confidence, regime_state, price, timestamp')
+            .select('*')
             .eq('symbol', symbol);
 
         if (fromDate) stateQuery = stateQuery.gte('timestamp', fromDate);
@@ -802,7 +1192,7 @@ async function getAggregatedStats(symbol = 'BTC', fromDate = null, toDate = null
             if (state.confidence) biasCounts[bias].totalConf += state.confidence;
 
             // Regime
-            const regime = state.regime_state || 'null';
+            const regime = state.primary_regime || state.regime_state || 'null';
             if (!regimeCounts[regime]) regimeCounts[regime] = { count: 0, totalConf: 0 };
             regimeCounts[regime].count++;
             if (state.confidence) regimeCounts[regime].totalConf += state.confidence;
@@ -1125,6 +1515,7 @@ module.exports = {
     getLatestState,
     getStateById,
     getStateCount,
+    hydrateDedupCache,
 
     // =====================================================================
     // STAGE 2: OUTCOME LABELING FUNCTIONS
@@ -1132,6 +1523,17 @@ module.exports = {
     updateStateOutcome,
     getUnlabeledStates,
     getOutcomeStats,
+
+    // =====================================================================
+    // STAGE 3: REPLAY STATE FUNCTIONS (separate table)
+    // =====================================================================
+    saveReplayState,
+    checkExistingReplayState,
+    getReplayStates,
+    getAllReplayStates,
+    getUnlabeledReplayStates,
+    updateReplayStateOutcome,
+    getReplayOutcomeStats,
 
     // Alert functions
     saveAlert,
@@ -1157,5 +1559,8 @@ module.exports = {
 
     // Deduplication helpers (for debugging/testing)
     DEDUP_CONFIG,
-    getTimeBucket
+    getTimeBucket,
+
+    // Supabase client (for external use)
+    getSupabase
 };

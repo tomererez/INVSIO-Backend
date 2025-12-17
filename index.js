@@ -7,10 +7,15 @@ const rateLimit = require('express-rate-limit');
 
 const logger = require('./src/utils/logger');
 const cacheManager = require('./src/utils/cache');
+const cronControl = require('./src/utils/cronControl');
 const { marketDataService, marketMetrics, alertService, stateStorage } = require('./src/services');
+const configService = require('./src/services/configService');
 const marketAnalyzerRoutes = require('./src/routes/marketAnalyzer');
 const backtestRoutes = require('./src/routes/backtest');
 const historyRoutes = require('./src/routes/historyRoutes');
+const replayRoutes = require('./src/routes/replayRoutes');
+const configRoutes = require('./src/routes/configRoutes');
+const dataRoutes = require('./src/routes/dataRoutes');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -32,7 +37,7 @@ app.set('trust proxy', 1);
 // CORS configuration
 app.use(cors({
   origin: process.env.NODE_ENV === 'production'
-    ? ['https://tradesmarter.base44.app', 'https://smartrading.com']
+    ? ['https://app.invsio.com', 'https://invsio.com']
     : '*',
   credentials: true
 }));
@@ -57,12 +62,15 @@ const limiter = rateLimit({
 // Apply rate limiting to API routes only
 app.use('/api/', limiter);
 
-// Request logging middleware
+// Request logging middleware (skip noisy polling endpoints)
+const SILENT_ENDPOINTS = ['/api/data/sync/status', '/health'];
 app.use((req, res, next) => {
-  logger.info(`${req.method} ${req.path}`, {
-    ip: req.ip,
-    userAgent: req.get('user-agent')
-  });
+  if (!SILENT_ENDPOINTS.includes(req.path)) {
+    logger.info(`${req.method} ${req.path}`, {
+      ip: req.ip,
+      userAgent: req.get('user-agent')
+    });
+  }
   next();
 });
 
@@ -72,7 +80,7 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'smartrading-backend',
+    service: 'invsio-backend',
     version: BUILD_INFO.version,
     buildInfo: BUILD_INFO,  // P0 FIX: Include full build info for verification
     timestamp: new Date().toISOString(),
@@ -95,10 +103,19 @@ app.use('/api/backtest', backtestRoutes);
 // History routes (Phase 4)
 app.use('/api/history', historyRoutes);
 
+// Replay backtest routes (Stage 3)
+app.use('/api/replay', replayRoutes);
+
+// Config calibration routes (Phase 8)
+app.use('/api/config', configRoutes);
+
+// Historical data routes (Phase 10)
+app.use('/api/data', dataRoutes);
+
 // Root route
 app.get('/', (req, res) => {
   res.json({
-    service: 'SmarTrading Backend',
+    service: 'INVSIO Backend',
     status: 'running',
     version: '2.2.0',
     endpoints: {
@@ -147,12 +164,19 @@ app.use((err, req, res, next) => {
 // ===== BACKGROUND TASKS =====
 
 /**
- * Cron job to pre-cache market data every 30 minutes
- * Runs at minute 15 and 45 to avoid startup conflicts
+ * Cron jobs for market data refresh
+ * DISABLED by default to avoid rate limits during development
+ * Set ENABLE_CRON_JOBS=true in .env to enable
  */
-if (process.env.NODE_ENV !== 'test') {
-  // Run at :15 and :45 past every hour (avoids startup collision)
-  cron.schedule('15,45 * * * *', async () => {
+if (process.env.NODE_ENV !== 'test' && process.env.ENABLE_CRON_JOBS === 'true') {
+  // Run every 5 minutes
+  cron.schedule('*/5 * * * *', async () => {
+    // Check if cron is paused (during replay batches)
+    if (cronControl.shouldSkip()) {
+      logger.info('⏸️ Cron skipped: Replay batch in progress');
+      return;
+    }
+
     logger.info('🔄 Running scheduled market data refresh...');
     try {
       const { snapshot, history } = await marketDataService.getFuturesMarketData('BTCUSDT', {
@@ -164,13 +188,13 @@ if (process.env.NODE_ENV !== 'test') {
       const alerts = alertService.checkAlerts(metrics);
 
       // Save state to database
-      const saveResult = stateStorage.saveMarketState(metrics);
+      const saveResult = await stateStorage.saveMarketState(metrics);
       if (saveResult.success) {
         logger.info(`💾 Market state saved: ${saveResult.id}`);
 
         // Save alerts if any
         if (alerts.length > 0) {
-          stateStorage.saveAlerts(alerts, saveResult.id);
+          await stateStorage.saveAlerts(alerts, saveResult.id);
           logger.info(`🔔 ${alerts.length} alerts saved`);
         }
       }
@@ -213,26 +237,51 @@ if (process.env.NODE_ENV !== 'test') {
     }
   });
 
-  logger.info('⏰ Background cron jobs initialized (refresh at :15/:45, daily summary at midnight)');
+  logger.info('⏰ Background cron jobs initialized (refresh every 5 min, daily summary at midnight)');
+} else {
+  logger.info('ℹ️ Cron jobs disabled (set ENABLE_CRON_JOBS=true to enable)');
 }
 
 // ===== SERVER STARTUP =====
 
 app.listen(PORT, async () => {
-  logger.info(`🚀 SmarTrading Backend v2.2 running on port ${PORT}`);
+  logger.info(`🚀 INVSIO Backend v2.2 running on port ${PORT}`);
   logger.info(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
   logger.info(`⏱️  Cache duration: ${process.env.CACHE_DURATION_MINUTES || 30} minutes`);
   logger.info(`🔗 Exchange mapping: Binance=BTCUSDT, Bybit=BTCUSD`);
   logger.info(`📈 Backtest API: ${process.env.COINGLASS_API_KEY ? 'Ready' : 'No API key'}`);
   logger.info(`💾 Database: Supabase PostgreSQL`);
 
+  // ===== PHASE 8: CONFIG INITIALIZATION =====
+  try {
+    const configResult = await configService.initializeConfig();
+    logger.info(`⚙️  Config loaded: v${configResult.version} (source: ${configResult.source})`);
+  } catch (configError) {
+    logger.warn('⚠️ Config initialization failed:', configError.message);
+    logger.info('   └─ Using fallback defaults');
+  }
+
   // ===== PHASE 5: STATE HYDRATION ON STARTUP =====
   try {
     logger.info('🔄 Hydrating state from database...');
+
+    // 1. Hydrate Deduplication Cache (Prevent duplicate state saves)
+    await stateStorage.hydrateDedupCache('BTC');
+
+    // 2. Hydrate Alert Cooldowns (Prevent duplicate alerts)
+    // Look back 4 hours (max alert cooldown)
+    const alertLookback = 4 * 60 * 60 * 1000;
+    const recentAlerts = await stateStorage.getAlertHistory(Date.now() - alertLookback, null, null, 500);
+    alertService.hydrateCooldowns(recentAlerts);
+
+    // 3. Hydrate Previous State (Context for trends)
     const lastState = await stateStorage.getLatestState('BTC');
 
     if (lastState && lastState.full_state_json) {
-      const parsedState = JSON.parse(lastState.full_state_json);
+      // full_state_json is already parsed by Supabase (JSONB → JS object)
+      const parsedState = typeof lastState.full_state_json === 'string'
+        ? JSON.parse(lastState.full_state_json)
+        : lastState.full_state_json;
       alertService.setPreviousState(parsedState);
       logger.info(`✅ State hydrated from ${new Date(lastState.timestamp).toISOString()}`);
       logger.info(`   └─ Last bias: ${lastState.bias}, confidence: ${lastState.confidence}`);
@@ -244,58 +293,64 @@ app.listen(PORT, async () => {
     logger.info('   └─ Continuing without previous state');
   }
 
-  // Pre-populate cache on startup (with delay to avoid rate limits)
-  setTimeout(async () => {
-    try {
-      logger.info('🔄 Pre-populating cache...');
-      const startTime = Date.now();
+  // Pre-populate cache on startup - DISABLED to avoid rate limits
+  // The cache will be populated on the first request or cron job instead
+  // This prevents the "Too Many Requests" errors on server restart
+  if (process.env.ENABLE_STARTUP_CACHE === 'true') {
+    setTimeout(async () => {
+      try {
+        logger.info('🔄 Pre-populating cache...');
+        const startTime = Date.now();
 
-      const { snapshot, history } = await marketDataService.getFuturesMarketData('BTCUSDT', {
-        timeframes: ['30m', '1h', '4h', '1d']
-      });
-      const metrics = marketMetrics.calculateMarketMetrics({ snapshot, history });
-
-      // Check for alerts
-      const alerts = alertService.checkAlerts(metrics);
-
-      // Log alert events
-      if (alerts.length > 0) {
-        alerts.forEach(alert => {
-          logger.info(`🔔 ALERT FIRED: [${alert.type}] ${alert.title}`, {
-            priority: alert.priority,
-            id: alert.id
-          });
+        const { snapshot, history } = await marketDataService.getFuturesMarketData('BTCUSDT', {
+          timeframes: ['30m', '1h', '4h', '1d']
         });
-      }
+        const metrics = marketMetrics.calculateMarketMetrics({ snapshot, history });
 
-      // Save initial state to database
-      const saveResult = await stateStorage.saveMarketState(metrics);
-      if (saveResult.success) {
-        logger.info(`💾 Initial market state saved: ${saveResult.id}`);
+        // Check for alerts
+        const alerts = alertService.checkAlerts(metrics);
 
+        // Log alert events
         if (alerts.length > 0) {
-          await stateStorage.saveAlerts(alerts, saveResult.id);
-          logger.info(`🔔 ${alerts.length} initial alerts saved`);
+          alerts.forEach(alert => {
+            logger.info(`🔔 ALERT FIRED: [${alert.type}] ${alert.title}`, {
+              priority: alert.priority,
+              id: alert.id
+            });
+          });
         }
+
+        // Save initial state to database
+        const saveResult = await stateStorage.saveMarketState(metrics);
+        if (saveResult.success) {
+          logger.info(`💾 Initial market state saved: ${saveResult.id}`);
+
+          if (alerts.length > 0) {
+            await stateStorage.saveAlerts(alerts, saveResult.id);
+            logger.info(`🔔 ${alerts.length} initial alerts saved`);
+          }
+        }
+
+        cacheManager.set('market_snapshot_btc', {
+          success: true,
+          data: { ...metrics, alerts },
+          meta: {
+            cached: false,
+            timestamp: new Date().toISOString(),
+            source: 'coinglass_api_v4',
+            stateId: saveResult.id
+          }
+        });
+
+        const duration = Date.now() - startTime;
+        logger.info(`✅ Initial cache populated in ${(duration / 1000).toFixed(1)}s`);
+      } catch (error) {
+        logger.error('❌ Failed to populate initial cache:', error.message);
       }
-
-      cacheManager.set('market_snapshot_btc', {
-        success: true,
-        data: { ...metrics, alerts },
-        meta: {
-          cached: false,
-          timestamp: new Date().toISOString(),
-          source: 'coinglass_api_v4',
-          stateId: saveResult.id
-        }
-      });
-
-      const duration = Date.now() - startTime;
-      logger.info(`✅ Initial cache populated in ${(duration / 1000).toFixed(1)}s`);
-    } catch (error) {
-      logger.error('❌ Failed to populate initial cache:', error.message);
-    }
-  }, 2000); // 2 second delay after startup
+    }, 2000);
+  } else {
+    logger.info('ℹ️ Startup cache pre-population disabled (set ENABLE_STARTUP_CACHE=true to enable)');
+  }
 });
 
 // Graceful shutdown

@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const { marketDataService, marketMetrics, alertService, llmExplainer, stateStorage } = require('../services');
+const { marketDataService, marketMetrics, alertService, llmExplainer, stateStorage, absorptionService } = require('../services');
+const configService = require('../services/configService');
 const cacheManager = require('../utils/cache');
 const logger = require('../utils/logger');
 
@@ -326,9 +327,35 @@ router.get('/btc', async (req, res) => {
       timeframes: ['30m', '1h', '4h', '1d']
     });
 
+    // Phase 6: Absorption Logic (V3)
+    // 1. Resolve existing events (Phase 2)
+    const resolvedAbsorptions = await absorptionService.checkAndResolveAbsorptions({
+      candles: history,
+      symbol: 'BTC'
+    });
+
     // Calculate comprehensive metrics
     logger.info('Calculating market metrics...');
-    const metrics = marketMetrics.calculateMarketMetrics({ snapshot, history });
+    // Note: passing resolvedAbsorptions as options (3rd arg)
+    const metrics = marketMetrics.calculateMarketMetrics(
+      { snapshot, history },
+      {},
+      { resolvedAbsorptions }
+    );
+
+    // 2. Persist NEW detections (Phase 1)
+    for (const tf in metrics.timeframes) {
+      const abs = metrics.timeframes[tf]?.absorption?.detected;
+      if (abs && abs.detected) {
+        const event = { ...abs, timeframe: tf, symbol: 'BTC' };
+        const saveResult = await absorptionService.saveAbsorptionEvent(event);
+        if (saveResult.success) {
+          logger.info(`[ABSORPTION] Saved new event: ${tf} ${event.cvdDirection}`);
+        } else if (!saveResult.duplicate) {
+          logger.warn(`[ABSORPTION] Failed to save event: ${saveResult.error}`);
+        }
+      }
+    }
 
     // Phase 5: Log macro anchoring triggers
     if (metrics.finalDecision?.macroOverride?.triggered) {
@@ -381,6 +408,9 @@ router.get('/btc', async (req, res) => {
         source: 'coinglass_api_v4',
         // A) P0 FIX: Include build info for version verification
         buildInfo: BUILD_VERSION,
+        // Config version for calibration tracking
+        configVersion: configService.getCachedVersion(),
+        configSource: configService.getConfigSource(),
         alertsGenerated: alerts.length,
         stateId,
         responseTime: `${duration}ms`,

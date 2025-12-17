@@ -1,6 +1,10 @@
 // marketMetrics.js - ULTIMATE VERSION
 // Strategic Whale Analysis (Claude) + Technical Depth (ChatGPT)
 // Based on SmartTrading Market Analyzer Logic Document
+// 
+// PHASE 8: Config-Driven - All thresholds/weights read from configService
+
+const configService = require('./configService');
 
 /**
  * =======================================================================
@@ -18,14 +22,13 @@
 
 /**
  * =======================================================================
- * PART 0.1: TIMEFRAME-AWARE THRESHOLDS
+ * PART 0.1: TIMEFRAME-AWARE THRESHOLDS (CONFIG-DRIVEN)
  * =======================================================================
- * These thresholds define what constitutes "noise" vs "significant" moves
- * for each timeframe. This prevents treating a 0.3% 30m move the same as
- * a 0.3% daily move.
+ * These thresholds are now loaded from config with fallback defaults.
  */
 
-const THRESHOLDS = {
+// Fallback defaults (used if config fails to load)
+const DEFAULT_THRESHOLDS = {
   '30m': {
     price: { noise: 0.25, strong: 0.5 },
     oi: { quiet: 0.15, aggressive: 0.3 },
@@ -48,6 +51,90 @@ const THRESHOLDS = {
   }
 };
 
+const DEFAULT_CVD_THRESHOLDS = {
+  '30m': { slopeStrong: 0.02, slopeWeak: 0.005, divergenceMin: 0.01 },
+  '1h': { slopeStrong: 0.025, slopeWeak: 0.008, divergenceMin: 0.015 },
+  '4h': { slopeStrong: 0.03, slopeWeak: 0.01, divergenceMin: 0.02 },
+  '1d': { slopeStrong: 0.04, slopeWeak: 0.015, divergenceMin: 0.025 }
+};
+
+/**
+ * Get thresholds for a specific timeframe (config-driven with fallback)
+ */
+function getThresholds(timeframe) {
+  const config = configService.getCachedConfig();
+  return config?.thresholds?.[timeframe] || DEFAULT_THRESHOLDS[timeframe] || DEFAULT_THRESHOLDS['4h'];
+}
+
+/**
+ * Get CVD thresholds for a specific timeframe (config-driven with fallback)
+ */
+function getCVDThresholds(timeframe) {
+  const config = configService.getCachedConfig();
+  return config?.thresholds?.cvd?.[timeframe] || DEFAULT_CVD_THRESHOLDS[timeframe] || DEFAULT_CVD_THRESHOLDS['4h'];
+}
+
+/**
+ * Get signal weights (config-driven with fallback)
+ */
+function getSignalWeights() {
+  const config = configService.getCachedConfig();
+  return config?.weights?.signals || {
+    exchange_divergence: 0.35,
+    market_regime: 0.20,
+    structure: 0.15,
+    technical: 0.10,
+    cvd: 0.10,
+    vwap: 0.05,
+    funding: 0.05
+  };
+}
+
+/**
+ * Get gates configuration (config-driven with fallback)
+ */
+function getGates() {
+  const config = configService.getCachedConfig();
+  return config?.gates || {
+    whaleRetail: {
+      scalping: { minPct: 0.2, minUsd: 2000000 },
+      macro: { minPct: 0.5, minUsd: 10000000 }
+    },
+    minConfidence: 5,
+    minSampleSize: 5,
+    maxStalenessMinutes: 30
+  };
+}
+
+/**
+ * Get penalties configuration (config-driven with fallback)
+ */
+function getPenalties() {
+  const config = configService.getCachedConfig();
+  return config?.penalties || {
+    conflict: 0.15,
+    staleness: 0.10,
+    lowLiquidity: 0.10,
+    unreliableData: 0.20
+  };
+}
+
+/**
+ * Get VWAP bands (config-driven with fallback)
+ */
+function getVWAPBands() {
+  const config = configService.getCachedConfig();
+  return config?.thresholds?.vwap || { innerBand: 0.01, outerBand: 0.02 };
+}
+
+// Legacy compatibility - keep THRESHOLDS reference for any direct usage
+// But these now just reference defaults; actual code should use getThresholds()
+const THRESHOLDS = DEFAULT_THRESHOLDS;
+const CVD_THRESHOLDS = DEFAULT_CVD_THRESHOLDS;
+
+// VWAP_THRESHOLDS removed - VWAP uses fixed bands (±1%, ±2%) for all timeframes
+// VWAP is ALWAYS daily (session-based, 00:00 UTC start)
+
 /**
  * =======================================================================
  * PART 0.2: CLASSIFIER FUNCTIONS
@@ -63,7 +150,7 @@ const THRESHOLDS = {
  * @returns {Object} { direction: 'UP'|'DOWN'|'FLAT', strength: 'noise'|'normal'|'strong' }
  */
 function classifyPriceMove(changePct, timeframe) {
-  const t = THRESHOLDS[timeframe] || THRESHOLDS['4h'];
+  const t = getThresholds(timeframe);
   const abs = Math.abs(changePct || 0);
 
   if (abs < t.price.noise) return { direction: 'FLAT', strength: 'noise' };
@@ -81,7 +168,7 @@ function classifyPriceMove(changePct, timeframe) {
  * @returns {Object} { direction: 'RISING'|'FALLING'|'FLAT', strength: 'quiet'|'normal'|'aggressive' }
  */
 function classifyOiMove(changePct, timeframe) {
-  const t = THRESHOLDS[timeframe] || THRESHOLDS['4h'];
+  const t = getThresholds(timeframe);
   const abs = Math.abs(changePct || 0);
 
   if (abs < t.oi.quiet) return { direction: 'FLAT', strength: 'quiet' };
@@ -117,6 +204,197 @@ function classifyFundingLevel(rate, zScore) {
 function computeConfidence(conditions) {
   const met = conditions.filter(c => c).length;
   return Math.round((met / conditions.length) * 10);
+}
+
+/**
+ * =======================================================================
+ * PART 0.3: CVD INTERPRETATION (NEW)
+ * =======================================================================
+ * Interprets CVD slope data with gating logic for noise filtering.
+ * 
+ * Gates:
+ * 1. Slope < slopeWeak → NEUTRAL (noise)
+ * 2. Price flat + CVD slope → accumulation/distribution
+ * 3. Price vs CVD divergence → bullish/bearish divergence
+ * 4. Aligned → confirmation
+ */
+function interpretCVD(cvdData, priceChange, timeframe) {
+  const thresholds = getCVDThresholds(timeframe);
+  const { cvdSlopeNormalized, cvdDirection } = cvdData || {};
+
+  // Default: neutral/no signal
+  const result = {
+    cvdBias: 'NEUTRAL',
+    cvdConfidence: 0,
+    cvdSignalType: 'none'
+  };
+
+  // No CVD data
+  if (!cvdData || cvdSlopeNormalized === undefined) {
+    result.cvdSignalType = 'no_data';
+    return result;
+  }
+
+  const absSlope = Math.abs(cvdSlopeNormalized || 0);
+  const absPriceChange = Math.abs(priceChange || 0);
+
+  // Gate 1: Is CVD slope significant?
+  if (absSlope < thresholds.slopeWeak) {
+    result.cvdSignalType = 'noise';
+    return result;
+  }
+
+  // Gate 2: Is price move significant? (use existing price thresholds)
+  const priceThreshold = getThresholds(timeframe)?.price?.noise || 0.5;
+  if (absPriceChange < priceThreshold) {
+    // Price flat - CVD shows accumulation/distribution
+    result.cvdSignalType = cvdDirection === 'rising' ? 'accumulation' : 'distribution';
+    result.cvdBias = cvdDirection === 'rising' ? 'LONG' : 'SHORT';
+    result.cvdConfidence = Math.min(10, (absSlope / thresholds.slopeStrong) * 7);
+    return result;
+  }
+
+  // Gate 3: Check for divergence
+  const priceDirection = priceChange > 0 ? 'up' : 'down';
+  const isDiverging = (priceDirection === 'up' && cvdDirection === 'falling') ||
+    (priceDirection === 'down' && cvdDirection === 'rising');
+
+  if (isDiverging) {
+    // Divergence detected
+    const divergenceStrength = absSlope + (absPriceChange / 100); // Normalize price
+    if (divergenceStrength < thresholds.divergenceMin) {
+      result.cvdSignalType = 'weak_divergence';
+      return result;
+    }
+
+    result.cvdSignalType = priceDirection === 'up' ? 'bearish_divergence' : 'bullish_divergence';
+    result.cvdBias = cvdDirection === 'rising' ? 'LONG' : 'SHORT';
+    result.cvdConfidence = Math.min(10, (divergenceStrength / thresholds.divergenceMin) * 6);
+
+    return result;
+  }
+
+  // Gate 4: Confirmation (price and CVD aligned)
+  result.cvdSignalType = 'confirmation';
+  result.cvdBias = priceDirection === 'up' ? 'LONG' : 'SHORT';
+  result.cvdConfidence = Math.min(10, (absSlope / thresholds.slopeStrong) * 5);
+
+  return result;
+}
+
+/**
+ * =======================================================================
+ * PART 0.4: VWAP CALCULATION AND INTERPRETATION (NEW)
+ * =======================================================================
+ */
+
+/**
+ * Calculate VWAP (Volume Weighted Average Price)
+ * ALWAYS Daily Session-Based (00:00 UTC reset)
+ * @param {Array} priceHistory - Array of candles
+ * @returns {Object} { vwap, currentPrice, deviation, deviationPercent }
+ */
+function calculateVWAP(priceHistory) {
+  if (!priceHistory || priceHistory.length === 0) {
+    return { vwap: null, currentPrice: null, deviation: null, deviationPercent: null, error: 'No data' };
+  }
+
+  // 1. Determine Session Start (00:00 UTC of the last candle)
+  const lastCandle = priceHistory[priceHistory.length - 1];
+  const lastTime = lastCandle.timestamp || lastCandle.time || lastCandle.openTime || lastCandle.t;
+
+  if (!lastTime) {
+    return { vwap: null, error: 'No timestamp found' };
+  }
+
+  const lastDate = new Date(lastTime);
+  lastDate.setUTCHours(0, 0, 0, 0); // Reset to 00:00 UTC
+  const sessionStart = lastDate.getTime();
+
+  // 2. Filter candles for this session
+  const sessionCandles = [];
+  for (let i = priceHistory.length - 1; i >= 0; i--) {
+    const candle = priceHistory[i];
+    const time = candle.timestamp || candle.time || candle.openTime || candle.t;
+    if (time >= sessionStart) {
+      sessionCandles.unshift(candle);
+    } else {
+      break; // Stop once we go back past 00:00
+    }
+  }
+
+  if (sessionCandles.length === 0) {
+    return { vwap: null, error: 'No session data' };
+  }
+
+  // 3. Calculate VWAP
+  let sumPriceVolume = 0;
+  let sumVolume = 0;
+
+  sessionCandles.forEach(candle => {
+    const high = Number(candle.high || candle.h || candle.close || 0);
+    const low = Number(candle.low || candle.l || candle.close || 0);
+    const close = Number(candle.close || candle.c || candle.price || 0);
+    const volume = Number(candle.volume || candle.v || 0);
+
+    const typicalPrice = (high + low + close) / 3;
+    sumPriceVolume += typicalPrice * volume;
+    sumVolume += volume;
+  });
+
+  if (sumVolume === 0) {
+    return { vwap: null, error: 'Zero volume' };
+  }
+
+  const vwap = sumPriceVolume / sumVolume;
+  const currentPrice = Number(lastCandle.close || lastCandle.c || lastCandle.price || 0);
+  const deviation = vwap > 0 ? (currentPrice - vwap) / vwap : 0;
+
+  return {
+    vwap: Number(vwap.toFixed(2)),
+    currentPrice: Number(currentPrice.toFixed(2)),
+    deviation: Number(deviation.toFixed(6)),
+    deviationPercent: Number((deviation * 100).toFixed(4)),
+    sessionCandles: sessionCandles.length
+  };
+}
+
+/**
+ * Interpret VWAP deviation for signal generation
+ * VWAP is ALWAYS daily (session-based, 00:00 UTC start)
+ * Bands are config-driven (defaults: inner ±1%, outer ±2%)
+ * 
+ * @param {Object} vwapData - Result from calculateVWAP
+ * @returns {Object} { bias, confidence, signal }
+ */
+function interpretVWAP(vwapData) {
+  if (!vwapData || !vwapData.vwap) {
+    return { bias: 'NEUTRAL', confidence: 0, signal: 'no_data' };
+  }
+
+  const { deviation } = vwapData;
+  const bands = getVWAPBands();
+  const innerBand = bands.innerBand || 0.01;
+  const outerBand = bands.outerBand || 0.02;
+
+  // Extreme upper (≥ outer band) → strong SHORT
+  if (deviation >= outerBand) {
+    return { bias: 'SHORT', confidence: 10, signal: 'upper_extreme' };
+  }
+  // Extreme lower (≤ -outer band) → strong LONG
+  if (deviation <= -outerBand) {
+    return { bias: 'LONG', confidence: 10, signal: 'lower_extreme' };
+  }
+  // Upper band (inner to outer) → weak SHORT
+  if (deviation >= innerBand) {
+    return { bias: 'SHORT', confidence: 6, signal: 'upper_band' };
+  }
+  // Lower band (-inner to -outer) → weak LONG
+  if (deviation <= -innerBand) {
+    return { bias: 'LONG', confidence: 6, signal: 'lower_band' };
+  }
+  // At VWAP (within ±inner band) → NEUTRAL
+  return { bias: 'NEUTRAL', confidence: 0, signal: 'at_vwap' };
 }
 
 
@@ -462,14 +740,17 @@ function analyzeExchangeDivergence(binance4h, bybit4h, timeframe = '4h') {
  */
 // Issue 3 Fix: Calculate Whale/Retail Ratio with safety thresholds
 // P1: Whale/Retail Reliability by Timeframe (Percent + Notional)
+// Now config-driven via getGates()
 function calculateWhaleRetailRatio(bybitOiChange, binanceOiChange, bybitOiUsd = 0, timeframe = '4h') {
   const bybitAbs = Math.abs(bybitOiChange);
   const binanceAbs = Math.abs(binanceOiChange);
 
-  // Timeframe-specific thresholds
+  // Timeframe-specific thresholds (config-driven)
+  const gates = getGates();
   const isScalping = ['30m', '1h'].includes(timeframe);
-  const MIN_PCT = isScalping ? 0.2 : 0.5;
-  const MIN_USD = isScalping ? 2_000_000 : 10_000_000; // $2M for scalping, $10M for macro
+  const gateConfig = isScalping ? gates.whaleRetail?.scalping : gates.whaleRetail?.macro;
+  const MIN_PCT = gateConfig?.minPct || (isScalping ? 0.2 : 0.5);
+  const MIN_USD = gateConfig?.minUsd || (isScalping ? 2_000_000 : 10_000_000);
 
   const bybitChangeUsd = Math.abs((bybitOiChange / 100) * bybitOiUsd);
 
@@ -747,106 +1028,90 @@ function analyzeOiAdvanced(oiHistory, priceHistory) {
   };
 }
 
+
 /**
  * =======================================================================
- * PART 2.5: VOLUME PROFILE ANALYSIS (POC, VAH, VAL)
+ * PART 2.5: VOLUME PROFILE ANALYSIS
  * =======================================================================
  */
-
-function analyzeVolumeProfile(priceHistory, bins = 50) {
+function analyzeVolumeProfile(priceHistory) {
   if (!priceHistory || priceHistory.length < 10) {
-    return {
-      poc: null,
-      vah: null,
-      val: null,
-      profile: []
-    };
+    return { poc: null, vah: null, val: null };
   }
 
   // 1. Find Range
   let min = Infinity;
   let max = -Infinity;
-  priceHistory.forEach(p => {
-    if (p.low < min) min = p.low;
-    if (p.high > max) max = p.high;
+  priceHistory.forEach(c => {
+    const l = Number(c.low);
+    const h = Number(c.high);
+    if (l < min) min = l;
+    if (h > max) max = h;
   });
 
-  if (min === max) {
-    return { poc: min, vah: min, val: min, profile: [] };
+  if (min === Infinity || max === -Infinity || min === max) {
+    return { poc: null, vah: null, val: null };
   }
 
+  // 2. Create Buckets
+  const numBuckets = 50;
   const range = max - min;
-  const binSize = range / bins;
+  const bucketSize = range / numBuckets;
+  const buckets = new Array(numBuckets).fill(0);
 
-  // 2. Distribute Volume
-  const profile = new Array(bins).fill(0).map((_, i) => ({
-    price: min + (i * binSize) + (binSize / 2),
-    volume: 0,
-    index: i
-  }));
+  // 3. Populate Buckets
+  priceHistory.forEach(c => {
+    const vol = Number(c.volume || 0);
+    if (vol <= 0) return;
 
-  priceHistory.forEach(p => {
-    // Determine which bins this candle touches
-    const startBin = Math.max(0, Math.floor((p.low - min) / binSize));
-    const endBin = Math.min(bins - 1, Math.floor((p.high - min) / binSize));
-
-    // Distribute volume uniformly across touched bins
-    // A better approx would be Gaussian, but uniform is standard for TPO
-    const binsTouched = endBin - startBin + 1;
-    const volPerBin = p.volume / binsTouched;
-
-    for (let i = startBin; i <= endBin; i++) {
-      profile[i].volume += volPerBin;
-    }
+    // Spread volume (Simple: use typical price)
+    const typical = (Number(c.high) + Number(c.low) + Number(c.close)) / 3;
+    const bucketIdx = Math.min(numBuckets - 1, Math.floor((typical - min) / bucketSize));
+    buckets[bucketIdx] += vol;
   });
 
-  // 3. Find POC (Point of Control)
+  // 4. Find POC
   let maxVol = 0;
-  let pocIndex = 0;
-
-  profile.forEach((bin, i) => {
-    if (bin.volume > maxVol) {
-      maxVol = bin.volume;
-      pocIndex = i;
+  let pocIdx = 0;
+  let totalVol = 0;
+  buckets.forEach((vol, i) => {
+    totalVol += vol;
+    if (vol > maxVol) {
+      maxVol = vol;
+      pocIdx = i;
     }
   });
 
-  const poc = profile[pocIndex].price;
+  const pocPrice = min + (pocIdx * bucketSize) + (bucketSize / 2);
 
-  // 4. Calculate Value Area (70% of total volume)
-  const totalVolume = profile.reduce((acc, bin) => acc + bin.volume, 0);
-  const targetVolume = totalVolume * 0.70;
+  // 5. Calculate VA (70%)
+  const targetVol = totalVol * 0.70;
+  let currentVol = maxVol;
+  let upIdx = pocIdx;
+  let downIdx = pocIdx;
 
-  let currentVolume = maxVol;
-  let upIndex = pocIndex;
-  let downIndex = pocIndex;
+  while (currentVol < targetVol) {
+    const upVol = (upIdx < numBuckets - 1) ? buckets[upIdx + 1] : 0;
+    const downVol = (downIdx > 0) ? buckets[downIdx - 1] : 0;
 
-  // Expand from POC outwards
-  while (currentVolume < targetVolume) {
-    const nextUp = upIndex < bins - 1 ? profile[upIndex + 1].volume : 0;
-    const nextDown = downIndex > 0 ? profile[downIndex - 1].volume : 0;
+    if (upVol === 0 && downVol === 0) break;
 
-    if (nextUp === 0 && nextDown === 0) break; // Should not happen
-
-    if (nextUp > nextDown) {
-      upIndex = Math.min(bins - 1, upIndex + 1);
-      currentVolume += profile[upIndex].volume;
+    if (upVol > downVol) {
+      upIdx++;
+      currentVol += buckets[upIdx];
     } else {
-      downIndex = Math.max(0, downIndex - 1);
-      currentVolume += profile[downIndex].volume;
+      downIdx--;
+      currentVol += buckets[downIdx];
     }
   }
 
-  const vah = profile[upIndex].price;
-  const val = profile[downIndex].price;
+  const vah = min + (upIdx * bucketSize) + (bucketSize / 2);
+  const val = min + (downIdx * bucketSize) + (bucketSize / 2);
 
   return {
-    poc: Number(poc.toFixed(2)),
+    poc: Number(pocPrice.toFixed(2)),
     vah: Number(vah.toFixed(2)),
-    val: Number(val.toFixed(2)),
-    totalVolume: Number(totalVolume.toFixed(0)),
-    // Return simplified profile for plotting if needed (top 10 levels?)
-    // For now, just metrics
+    val: Number(val.toFixed(2))
   };
 }
 
@@ -1272,16 +1537,19 @@ function calculateWeightedDecision(
 ) {
   const signals = [];
 
-  // Signal 1: Exchange Divergence (35% weight)
+  // Get weights from config (config-driven)
+  const weights = getSignalWeights();
+
+  // Signal 1: Exchange Divergence
   signals.push({
     name: "exchange_divergence",
     signal: exchangeAnalysis.bias,
     confidence: exchangeAnalysis.confidence, // 0-10
-    weight: 0.35,
+    weight: weights.exchange_divergence || 0.35,
     reasoning: exchangeAnalysis.warnings[0]
   });
 
-  // Signal 2: Market Regime (20% weight)
+  // Signal 2: Market Regime
   const regimeBias =
     regimeAnalysis.regime === "distribution" || regimeAnalysis.subType === "long_trap" ? "SHORT" :
       regimeAnalysis.regime === "accumulation" || regimeAnalysis.subType === "short_trap" ? "LONG" :
@@ -1292,11 +1560,11 @@ function calculateWeightedDecision(
     name: "market_regime",
     signal: regimeBias,
     confidence: regimeAnalysis.confidence,
-    weight: 0.20,
+    weight: weights.market_regime || 0.20,
     reasoning: regimeAnalysis.characteristics[0]
   });
 
-  // Signal 3: Structure Analysis (15% weight)
+  // Signal 3: Structure Analysis
   let structureBias = "WAIT";
   let structureConf = 5;
   let structureReason = "Structure is neutral";
@@ -1325,39 +1593,45 @@ function calculateWeightedDecision(
     name: "structure",
     signal: structureBias,
     confidence: structureConf,
-    weight: 0.15,
+    weight: weights.structure || 0.15,
     reasoning: structureReason
   });
 
-  // Signal 4: Volume Profile (10% weight)
-  let vpBias = "WAIT";
-  let vpConf = 5;
-  let vpReason = "Inside value area";
+  // Signal 4: VWAP (5% weight) - Uses fixed bands (±1%, ±2%)
+  // VWAP is ALWAYS daily (session-based, 00:00 UTC start)
+  const vwapData = options.vwapData || { vwap: null };
+  const vwapInterpretation = interpretVWAP(vwapData);
 
-  if (volumeProfile && volumeProfile.val && volumeProfile.vah) {
-    const price = binanceData.price;
-    if (price < volumeProfile.val) {
-      vpBias = "LONG";
-      vpConf = 7;
-      vpReason = "Price below Value Area (Oversold)";
-    } else if (price > volumeProfile.vah) {
-      vpBias = "SHORT";
-      vpConf = 7;
-      vpReason = "Price above Value Area (Overbought)";
-    } else if (Math.abs(price - volumeProfile.poc) / price < 0.005) {
-      vpReason = "Price at Point of Control (Fair Value)";
-    }
+  // Build reasoning based on new signal values
+  let vwapReasoning = "VWAP data unavailable";
+  const deviationPct = vwapData.deviationPercent || 0;
+  switch (vwapInterpretation.signal) {
+    case 'upper_extreme':
+      vwapReasoning = `Price ${deviationPct.toFixed(2)}% above VWAP (Extreme Premium ≥2%)`;
+      break;
+    case 'lower_extreme':
+      vwapReasoning = `Price ${Math.abs(deviationPct).toFixed(2)}% below VWAP (Extreme Discount ≤-2%)`;
+      break;
+    case 'upper_band':
+      vwapReasoning = `Price ${deviationPct.toFixed(2)}% above VWAP (Premium 1-2%)`;
+      break;
+    case 'lower_band':
+      vwapReasoning = `Price ${Math.abs(deviationPct).toFixed(2)}% below VWAP (Discount 1-2%)`;
+      break;
+    case 'at_vwap':
+      vwapReasoning = "Price at VWAP (Fair Value within ±1%)";
+      break;
   }
 
   signals.push({
-    name: "volume_profile",
-    signal: vpBias,
-    confidence: vpConf,
-    weight: 0.10,
-    reasoning: vpReason
+    name: "vwap",
+    signal: vwapInterpretation.bias,
+    confidence: vwapInterpretation.confidence,
+    weight: weights.vwap || 0.05,
+    reasoning: vwapReasoning
   });
 
-  // Signal 5: Technical Analysis (10% weight)
+  // Signal 5: Technical Analysis
   const techBias = technicalMetrics.technicalBias || "WAIT";
   const techStrength = technicalMetrics.trend?.strength || 0;
   const techDirection = technicalMetrics.trend?.direction || "unknown";
@@ -1366,13 +1640,13 @@ function calculateWeightedDecision(
     name: "technical",
     signal: techBias,
     confidence: Math.abs(techStrength) * 10,
-    weight: 0.10,
+    weight: weights.technical || 0.10,
     reasoning: techDirection !== "unknown"
       ? `Trend ${techDirection} with strength ${techStrength}`
       : "No technical data available"
   });
 
-  // Signal 6: Funding (5% weight)
+  // Signal 6: Funding
   const fundingExtreme = fundingAdvanced?.extremeLevel || "normal";
   const fundingBias = fundingAdvanced?.fundingBias || "WAIT";
   const fundingZ = fundingAdvanced?.zScore || 0;
@@ -1381,73 +1655,103 @@ function calculateWeightedDecision(
     name: "funding",
     signal: fundingBias,
     confidence: Math.abs(fundingZ) * 2, // Approx confidence from Z
-    weight: 0.05,
+    weight: weights.funding || 0.05,
     reasoning: `Funding ${fundingExtreme} (Pain: $${fundingAdvanced?.painIndex || 0}M)`
   });
-
-  // Signal 7: CVD (5% weight) - P0 FIX: Enhanced CVD Gating
-  const cvd = binanceData.cvd || 0;
-  const cvdNormalized = binanceData.cvdNormalized || 0;
-  const cvdReliable = binanceData.cvdReliableForTf !== false; // Default to true for backward compat
-  const cvdResolution = binanceData.cvdResolution;  // Actual API interval (m30, h1, h4, h24)
-  const cvdRequestedTf = binanceData.cvdRequestedTimeframe || options.timeframe;  // Requested TF
-  const cvdDataReason = binanceData.cvdReason;
+  // Signal 7: CVD (10% weight) - REFACTORED: Uses interpretCVD with slope analysis
   const priceChange = binanceData.price_change || 0;
+  const cvdReliable = binanceData.cvdReliableForTf !== false;
+  const cvdResolution = binanceData.cvdResolution;
+  const cvdDataReason = binanceData.cvdReason;
 
-  // CVD Resolution Logic - now uses actual metadata from data service
-  let cvdWeight = 0.05;
-  let cvdReason = `CVD ${cvd > 0 ? 'positive' : 'negative'} (${cvdNormalized > 0 ? '+' : ''}${(cvdNormalized * 100).toFixed(1)}% normalized) [${cvdResolution || 'unknown'}]`;
-  let cvdBias =
-    priceChange > 0 && cvd < 0 ? "SHORT" :
-      priceChange < 0 && cvd > 0 ? "LONG" :
-        priceChange > 0 && cvd > 0 ? "LONG" :
-          priceChange < 0 && cvd < 0 ? "SHORT" : "WAIT";
+  // Get CVD slope data from options (passed in from caller with cvdSlopeData)
+  const cvdSlopeData = options.cvdSlopeData || {
+    cvdSlopeNormalized: 0,
+    cvdDirection: 'flat',
+    cvdTotal: binanceData.cvd || 0
+  };
 
-  // P0 FIX: CVD reliability gating based on actual data quality
+  // Use new interpretCVD for gated analysis
+  const cvdInterpretation = interpretCVD(cvdSlopeData, priceChange, options.timeframe);
+
+  // Apply reliability gating on top of interpretation
+  let cvdWeight = weights.cvd || 0.10;
   let cvdWarning = null;
 
   // Gate 1: Resolution mismatch (legacy case - 24h data on scalping TF)
   if (['30m', '1h'].includes(options.timeframe) && cvdResolution === 'h24') {
     cvdWeight = 0;
-    cvdReason = "CVD excluded: 24h aggregate data used for scalping timeframe";
-    cvdBias = "WAIT";
+    cvdInterpretation.cvdBias = 'NEUTRAL';
+    cvdInterpretation.cvdConfidence = 0;
     cvdWarning = "CVD excluded: resolution mismatch (h24 data on scalping TF)";
   }
   // Gate 2: Data reliability check from calculateCVDPerTimeframe
   else if (!cvdReliable) {
     cvdWeight = 0;
-    cvdReason = `CVD excluded: ${cvdDataReason || 'insufficient data quality'}`;
-    cvdBias = "WAIT";
+    cvdInterpretation.cvdBias = 'NEUTRAL';
+    cvdInterpretation.cvdConfidence = 0;
     cvdWarning = `CVD excluded: ${cvdDataReason || 'data quality issue'}`;
-  }
-  // Gate 3: Requested timeframe sanity check - verify we got data for the TF we asked for
-  else if (cvdRequestedTf !== options.timeframe) {
-    cvdWeight = 0;
-    cvdReason = `CVD excluded: requested ${cvdRequestedTf} but analyzing ${options.timeframe}`;
-    cvdBias = "WAIT";
-    cvdWarning = `CVD excluded: timeframe mismatch (${cvdRequestedTf} vs ${options.timeframe})`;
   }
 
   signals.push({
     name: "cvd",
-    signal: cvdBias,
-    confidence: cvdReliable ? 6 : 0,
+    signal: cvdInterpretation.cvdBias,
+    confidence: cvdInterpretation.cvdConfidence,
     weight: cvdWeight,
-    reasoning: cvdReason,
-    // P0 FIX: Include CVD metadata in signal for transparency
+    reasoning: cvdInterpretation.cvdSignalType === 'noise'
+      ? "CVD slope too weak to signal"
+      : cvdInterpretation.cvdSignalType === 'accumulation'
+        ? "CVD rising while price flat (Accumulation)"
+        : cvdInterpretation.cvdSignalType === 'distribution'
+          ? "CVD falling while price flat (Distribution)"
+          : cvdInterpretation.cvdSignalType === 'bearish_divergence'
+            ? "CVD falling while price up (Bearish Divergence)"
+            : cvdInterpretation.cvdSignalType === 'bullish_divergence'
+              ? "CVD rising while price down (Bullish Divergence)"
+              : cvdInterpretation.cvdSignalType === 'confirmation'
+                ? `CVD confirming price ${priceChange > 0 ? 'up' : 'down'}`
+                : "CVD signal neutral",
     metadata: {
       cvdResolution,
-      cvdNormalized,
-      // Split reliability flags
+      cvdSlopeNormalized: cvdSlopeData.cvdSlopeNormalized,
+      cvdDirection: cvdSlopeData.cvdDirection,
+      cvdSignalType: cvdInterpretation.cvdSignalType,
       cvdDataComplete: binanceData.cvdDataComplete,
       cvdMarketImpactReliable: binanceData.cvdMarketImpactReliable,
-      cvdReliable,  // Combined flag (both must be true)
-      cvdWindowCandles: binanceData.cvdWindowCandles,
-      cvdActualCandles: binanceData.cvdActualCandles,
-      cvdAvgVolumePerCandle: binanceData.cvdAvgVolumePerCandle,
+      cvdReliable,
       cvdWarning
     }
   });
+
+  // Signal 8: Absorption (Phase 2 Integration)
+  const absorption = options.absorption;
+  if (absorption) {
+    if (absorption.resolved) {
+      const res = absorption.resolved;
+      const isBullish = res.resolution === 'ACCUMULATION' || (res.resolution === 'TRAP' && res.cvd_direction === 'selling'); // Selling trap -> Bullish
+      const isBearish = res.resolution === 'DISTRIBUTION' || (res.resolution === 'TRAP' && res.cvd_direction === 'buying'); // Buying trap -> Bearish
+
+      if (isBullish || isBearish) {
+        signals.push({
+          name: "absorption_resolved",
+          signal: isBullish ? "LONG" : "SHORT",
+          confidence: 10, // Max confidence for resolved metric
+          weight: 0.15,   // Significant weight
+          reasoning: `RESOLVED ${res.resolution}: ${res.resolution_reason}`
+        });
+      }
+    } else if (absorption.detected) {
+      // Phase 1 Detection - Monitor mode
+      // Can add a small signal or just reasoning
+      signals.push({
+        name: "absorption_detected",
+        signal: "WAIT",
+        confidence: 5,
+        weight: 0.0,
+        reasoning: `Potential ${absorption.detected.cvdDirection} absorption detected - monitoring for resolution`
+      });
+    }
+  }
 
   // P0-1: Confidence Scale Contract (0-10)
   let longScore = 0, shortScore = 0, waitScore = 0;
@@ -1770,7 +2074,11 @@ function generateTimeframeBuckets(tfMetrics) {
  * =======================================================================
  */
 
-function calculateMarketMetrics(marketData, historicalData = {}) {
+
+function calculateMarketMetrics(marketData, historicalData = {}, options = {}) {
+  // Extract options
+  const { resolvedAbsorptions = [] } = options;
+
   // 1. Parsing Input
   let snapshot, historyMap;
 
@@ -1827,6 +2135,34 @@ function calculateMarketMetrics(marketData, historicalData = {}) {
     // 2.7 Regime
     const regimeAnalysis = detectMarketRegime(binanceData, bybitData, exchangeAnalysis.scenario, tf);
 
+    // 2.7.5 Calculate VWAP (Daily Session)
+    const vwapData = calculateVWAP(priceHistory);
+
+    // 2.7.6 Absorption Detection (Phase 1)
+    const cvdSeriesNorm = buildCvdSeriesNorm(tfHistory.candles || tfHistory.priceHistory, 50); // Assuming history acts as candles or converted
+
+    // We need object with { changePct, currentPrice }
+    const currentPriceData = {
+      changePct: binanceData.price_change,
+      currentPrice: binanceData.price
+    };
+
+    const oiDataForAbs = {
+      behavior: binanceData.oi_change > 0 ? 'rising' : 'falling',
+      currentOI: binanceData.oi
+    };
+
+    const absorptionEvent = detectAbsorption(
+      cvdSeriesNorm,
+      currentPriceData,
+      structure,
+      tf,
+      oiDataForAbs
+    );
+
+    // Find any RESOLVED absorption for this timeframe in passed options
+    const resolvedEvent = resolvedAbsorptions.find(a => a.timeframe === tf && a.symbol === (marketData.symbol || 'BTC'));
+
     // 2.8 Weighted Decision
     const decision = calculateWeightedDecision(
       binanceData,
@@ -1837,7 +2173,15 @@ function calculateMarketMetrics(marketData, historicalData = {}) {
       fundingAdvanced,
       volumeProfile,
       structure,
-      { timeframe: tf, cvdResolution: tf } // Assume resolution matches TF for now
+      {
+        timeframe: tf,
+        cvdResolution: tf,
+        vwapData,
+        absorption: {
+          detected: absorptionEvent,
+          resolved: resolvedEvent
+        }
+      }
     );
 
     tfMetrics[tf] = {
@@ -1848,6 +2192,10 @@ function calculateMarketMetrics(marketData, historicalData = {}) {
       oiAdvanced,
       volumeProfile,
       structure,
+      absorption: { // Store in metrics for response
+        detected: absorptionEvent,
+        resolved: resolvedEvent
+      },
       finalDecision: decision
     };
     tfDecisions[tf] = decision;
@@ -2020,9 +2368,155 @@ function calculateMarketMetrics(marketData, historicalData = {}) {
   };
 }
 
+/**
+ * =======================================================================
+ * PART 3: ABSORPTION DETECTION LOGIC (V3)
+ * =======================================================================
+ */
+
+/**
+ * Step 1: Per-candle Normalized Delta
+ * @param {Object} candle - { taker_buy_volume_usd, taker_sell_volume_usd }
+ * @returns {number} Value between -1 and +1
+ */
+function calculatePerCandleDelta(candle) {
+  const buyUsd = Number(candle.taker_buy_volume_usd || candle.buy_volume_quote || 0);
+  const sellUsd = Number(candle.taker_sell_volume_usd || candle.sell_volume_quote || 0);
+  const totalUsd = buyUsd + sellUsd;
+
+  if (totalUsd > 0) {
+    return (buyUsd - sellUsd) / totalUsd;
+  }
+  return 0;
+}
+
+/**
+ * Step 2: Build Normalized Series
+ * @param {Array} candles - Array of candles
+ * @param {number} windowSize - Default 50
+ * @returns {Array} Array of per-candle deltas
+ */
+function buildCvdSeriesNorm(candles, windowSize = 50) {
+  const safeCandles = Array.isArray(candles) ? candles : [];
+  if (!safeCandles.length) return [];
+
+  // Take last N candles
+  const windowCandles = safeCandles.slice(-windowSize);
+
+  return windowCandles.map(c => calculatePerCandleDelta(c));
+}
+
+/**
+ * Step 3: Calculate Slope on Recent Window
+ * @param {Array} cvdSeriesNorm - Array of normalized deltas
+ * @param {number} slopeWindow - Default 10
+ * @returns {number|null} Linear regression slope
+ */
+function calculateCvdSlopeNorm(cvdSeriesNorm, slopeWindow = 10) {
+  const arr = Array.isArray(cvdSeriesNorm) ? cvdSeriesNorm : [];
+  if (arr.length < slopeWindow) return null;
+
+  const recentWindow = arr.slice(-slopeWindow);
+  return TechnicalUtils.slope(recentWindow);
+}
+
+/**
+ * Step 4: Calculate Dynamic Noise Floor
+ * @param {Array} cvdSeriesNorm - Full array (e.g. 50 candles)
+ * @returns {number|null} STD * 1.5
+ */
+function calculateCvdNoiseFloor(cvdSeriesNorm) {
+  if (!cvdSeriesNorm || cvdSeriesNorm.length < 2) return null;
+  const std = TechnicalUtils.std(cvdSeriesNorm);
+  return std !== null ? std * 1.5 : null;
+}
+
+/**
+ * DETECT ABSORPTION (Phase 1)
+ * @param {Array} cvdSeriesNorm - Normalized CVD series (last 50)
+ * @param {Object} currentPriceData - { changePct, currentPrice }
+ * @param {Object} structure - { resistance, support }
+ * @param {string} timeframe - '30m', '1h', '4h', '1d'
+ * @param {Object} oiData - { behavior, currentOI } matching spec
+ * @returns {Object|null} Absorption event object or null
+ */
+function detectAbsorption(cvdSeriesNorm, currentPriceData, structure, timeframe = '4h', oiData = {}) {
+  // 1. Calculate Metrics
+  const cvdSlopeNorm = calculateCvdSlopeNorm(cvdSeriesNorm, 10);
+  const cvdNoiseFloor = calculateCvdNoiseFloor(cvdSeriesNorm);
+
+  if (cvdSlopeNorm === null || cvdNoiseFloor === null) return null;
+
+  // 2. Condition 1: Strong CVD
+  const isStrongCvd = Math.abs(cvdSlopeNorm) > cvdNoiseFloor;
+  if (!isStrongCvd) return null;
+
+  const cvdDirection = cvdSlopeNorm > 0 ? 'buying' : 'selling';
+
+  // 3. Condition 2: Price Not Responding
+  const thresholds = {
+    '30m': 0.25,
+    '1h': 0.4,
+    '4h': 0.65,
+    '1d': 1.15
+  };
+  const priceThreshold = thresholds[timeframe] || 0.65;
+  const priceChange = currentPriceData.changePct || 0; // In percent e.g. 0.5
+  const absPriceChange = Math.abs(priceChange);
+
+  let priceResponse = 'responsive';
+  // Check if flat
+  if (absPriceChange < priceThreshold) {
+    priceResponse = 'flat';
+  }
+  // Check if opposite
+  else if (cvdDirection === 'buying' && priceChange < 0) {
+    priceResponse = 'opposite';
+  } else if (cvdDirection === 'selling' && priceChange > 0) {
+    priceResponse = 'opposite';
+  }
+
+  // If price IS responding (e.g. buying + price up > threshold), NO ABSORPTION
+  if (priceResponse === 'responsive') return null;
+
+  // 4. Location Classification
+  let location = 'mid_range';
+  let srLevelUsed = null;
+  const price = currentPriceData.currentPrice;
+  const resistance = structure?.resistance; // lastSwingHigh
+  const support = structure?.support;       // lastSwingLow
+
+  // Threshold 0.3%
+  const LOC_THRESHOLD = 0.003;
+
+  if (resistance && price > resistance * (1 - LOC_THRESHOLD)) {
+    location = 'near_resistance';
+    srLevelUsed = resistance;
+  } else if (support && price < support * (1 + LOC_THRESHOLD)) {
+    location = 'near_support';
+    srLevelUsed = support;
+  }
+
+  // 5. Construct Event
+  return {
+    detected: true,
+    cvdDirection,
+    cvdStrength: cvdSlopeNorm,
+    cvdNoiseFloor,
+    oiBehavior: oiData.behavior || 'stable',
+    oiAtDetection: oiData.currentOI,
+    priceResponse,
+    priceAtDetection: price,
+    location,
+    srLevelUsed,
+    detectedAt: Date.now()
+  };
+}
+
 // =======================================================================
 // EXPORTS
 // =======================================================================
+
 
 module.exports = {
   calculateMarketMetrics,
@@ -2044,5 +2538,13 @@ module.exports = {
   compareVolumeDirection,
   // Timeframe Buckets
   generateTimeframeBuckets,
-  deriveTradeStanceFromBucket
+  deriveTradeStanceFromBucket,
+
+  // Absorption Logic (V3)
+  calculatePerCandleDelta,
+  buildCvdSeriesNorm,
+  calculateCvdSlopeNorm,
+  calculateCvdNoiseFloor,
+  detectAbsorption
 };
+

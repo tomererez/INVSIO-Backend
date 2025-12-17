@@ -1,7 +1,7 @@
 {
-  "name": "smartrading-backend",
+  "name": "invsio-backend",
   "version": "2.0.0",
-  "description": "SmarTrading AI Market Analyzer Backend - Ultimate Edition",
+  "description": "INVSIO AI Market Analyzer Backend",
   "main": "index.js",
   "scripts": {
     "dev": "nodemon index.js",

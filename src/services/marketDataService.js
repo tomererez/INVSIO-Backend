@@ -1,53 +1,18 @@
 // marketDataService.js
-// Responsible for fetching + unifying Futures market data for AI models
+// LIVE data fetching - responsible for fetching current market data for AI models
+// Uses coinglassClient as single source of truth for API communication
+//
+// NOTE: This service is for LIVE data only (limit-based, ends at "now")
+// For historical/replay data, use historicalDataService.js
 
-const axios = require("axios");
+const coinglassClient = require('./coinglassClient');
 
-const BASE_URL = "https://open-api-v4.coinglass.com/api";
-const API_KEY = process.env.COINGLASS_API_KEY;
-
-// Phase 5: Timeout configuration
-const API_TIMEOUT_MS = 30000; // 30 seconds for Coinglass API
-
-// ---------------------------
-// Generic request wrapper with timeout
-// ---------------------------
+/**
+ * Wrapper for backward compatibility - delegates to coinglassClient
+ * @deprecated Use coinglassClient.request() directly for new code
+ */
 async function coinglassGET(endpoint, params = {}) {
-  const startTime = Date.now();
-
-  try {
-    const { data } = await axios.get(`${BASE_URL}${endpoint}`, {
-      params,
-      headers: {
-        accept: "application/json",
-        "CG-API-KEY": API_KEY
-      },
-      timeout: API_TIMEOUT_MS
-    });
-
-    if (data.code !== "0") {
-      console.warn("⚠️ Coinglass API warning:", endpoint, params, data.msg);
-      return [];
-    }
-
-    const duration = Date.now() - startTime;
-    if (duration > 5000) {
-      console.warn(`⏱️ Slow API call: ${endpoint} took ${duration}ms`);
-    }
-
-    return data.data || [];
-  } catch (err) {
-    const duration = Date.now() - startTime;
-
-    // Handle timeout specifically
-    if (err.code === 'ECONNABORTED' || err.message?.includes('timeout')) {
-      console.error(`⏰ Coinglass TIMEOUT at ${endpoint} after ${duration}ms`);
-      return [];
-    }
-
-    console.error(`❌ Coinglass error at ${endpoint} (${duration}ms):`, err?.response?.data || err.message);
-    return [];
-  }
+  return coinglassClient.request(endpoint, params);
 }
 
 // ---------------------------
@@ -322,6 +287,104 @@ function calculateCVD(takerData) {
   }, 0);
 
   return Number(cvd.toFixed(2));
+}
+
+/**
+ * NEW: Calculate CVD with slope analysis using normalized deltas
+ * 
+ * Per-candle delta is normalized to -1 to +1 range:
+ *   delta = (buy - sell) / (buy + sell)
+ * 
+ * This allows cross-exchange and cross-timeframe comparison.
+ * 
+ * @param {Array} takerData - Taker buy/sell history from Coinglass
+ * @param {number} slopeWindow - Number of candles for slope calculation (default: 10)
+ * @returns {Object} CVD result with slope and direction
+ */
+function calculateCVDWithSlope(takerData, slopeWindow = 10) {
+  const result = {
+    cvdTotal: 0,
+    cvdTotalNormalized: 0,
+    cvdSlope: 0,
+    cvdSlopeNormalized: 0,
+    cvdDirection: 'flat',
+    cvdSeries: [],
+    cvdSeriesNormalized: []
+  };
+
+  if (!takerData?.length) {
+    return result;
+  }
+
+  // Step 1: Calculate per-candle normalized deltas and build cumulative series
+  let cumulativeRaw = 0;
+  let cumulativeNorm = 0;
+
+  takerData.forEach(candle => {
+    const buy = Number(candle.taker_buy_volume_usd || candle.buyVol || 0);
+    const sell = Number(candle.taker_sell_volume_usd || candle.sellVol || 0);
+    const total = buy + sell;
+
+    // Raw delta (USD)
+    const rawDelta = buy - sell;
+    cumulativeRaw += rawDelta;
+    result.cvdSeries.push(cumulativeRaw);
+
+    // Normalized delta (-1 to +1)
+    // Avoid division by zero
+    const normDelta = total > 0 ? (buy - sell) / total : 0;
+    cumulativeNorm += normDelta;
+    result.cvdSeriesNormalized.push(cumulativeNorm);
+  });
+
+  result.cvdTotal = Number(cumulativeRaw.toFixed(2));
+  result.cvdTotalNormalized = Number(cumulativeNorm.toFixed(4));
+
+  // Step 2: Calculate slope of recent N candles (normalized series)
+  if (result.cvdSeriesNormalized.length >= slopeWindow) {
+    const recentNorm = result.cvdSeriesNormalized.slice(-slopeWindow);
+    result.cvdSlopeNormalized = calculateSlope(recentNorm);
+
+    // Also calculate raw slope for reference
+    const recentRaw = result.cvdSeries.slice(-slopeWindow);
+    result.cvdSlope = calculateSlope(recentRaw);
+  }
+
+  // Step 3: Determine direction based on normalized slope
+  // Use small threshold to filter noise
+  const DIRECTION_THRESHOLD = 0.001;
+  if (result.cvdSlopeNormalized > DIRECTION_THRESHOLD) {
+    result.cvdDirection = 'rising';
+  } else if (result.cvdSlopeNormalized < -DIRECTION_THRESHOLD) {
+    result.cvdDirection = 'falling';
+  } else {
+    result.cvdDirection = 'flat';
+  }
+
+  return result;
+}
+
+/**
+ * Simple linear regression slope calculation
+ * @param {Array<number>} values - Array of numeric values
+ * @returns {number} Slope of the line
+ */
+function calculateSlope(values) {
+  const n = values.length;
+  if (n < 2) return 0;
+
+  let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+  for (let i = 0; i < n; i++) {
+    sumX += i;
+    sumY += values[i];
+    sumXY += i * values[i];
+    sumXX += i * i;
+  }
+
+  const numerator = n * sumXY - sumX * sumY;
+  const denominator = n * sumXX - sumX * sumX;
+
+  return denominator === 0 ? 0 : numerator / denominator;
 }
 
 /**

@@ -105,6 +105,43 @@ function isOscillating() {
 }
 
 /**
+ * Hydrate alert cooldowns from recent alert history.
+ * @param {Array} recentAlerts - List of recent alerts from DB
+ */
+function hydrateCooldowns(recentAlerts) {
+    if (!recentAlerts || !Array.isArray(recentAlerts)) return;
+
+    let count = 0;
+    const now = Date.now();
+
+    recentAlerts.forEach(alert => {
+        const category = alert.category || alert.alert_type || alert.type;
+        if (!category || !ALERT_CONFIG[category]) return;
+
+        // Check if this alert is recent enough to trigger cooldown
+        const cooldownMs = ALERT_CONFIG[category].cooldownMs;
+        const alertTime = new Date(alert.timestamp || alert.created_at).getTime();
+
+        if (now - alertTime < cooldownMs) {
+            // It's still within cooldown window
+            // We want to set the map to the alert's time
+            // BUT check if we already have a newer one
+            const existing = alertCooldowns.get(category);
+            if (!existing || alertTime > existing) {
+                alertCooldowns.set(category, alertTime);
+                count++;
+            }
+        }
+    });
+
+    if (count > 0) {
+        console.log(`✅ Alert cooldowns hydrated: ${count} active cooldowns restored`);
+    } else {
+        console.log('ℹ️ No active alert cooldowns found in recent history');
+    }
+}
+
+/**
  * =======================================================================
  * ALERT CHECKERS
  * =======================================================================
@@ -442,6 +479,7 @@ module.exports = {
     getPreviousState,
     setPreviousState,
     clearCooldowns,
+    hydrateCooldowns,
     getAlertStats,
     ALERT_CONFIG
 };

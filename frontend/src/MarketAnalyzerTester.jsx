@@ -39,7 +39,9 @@ import {
     Percent,
     TrendingUp as TrendUp,
     ArrowRightLeft,
-    BarChart2
+    BarChart2,
+    Download,
+    Pause
 } from "lucide-react";
 import {
     LineChart as RechartsLine,
@@ -460,6 +462,7 @@ export default function MarketAnalyzerTester() {
     const [error, setError] = useState(null);
     const [lastUpdate, setLastUpdate] = useState(null);
     const [autoRefresh, setAutoRefresh] = useState(false);
+    const [refreshInterval, setRefreshInterval] = useState(1); // Interval in minutes
     const [signalHistory, setSignalHistory] = useState([]);
     const [activeTab, setActiveTab] = useState("overview");
     const [connectionStatus, setConnectionStatus] = useState("disconnected");
@@ -468,6 +471,7 @@ export default function MarketAnalyzerTester() {
     const [debugLogs, setDebugLogs] = useState([]);
     const [fetchTimer, setFetchTimer] = useState(null);
     const [lastFetchDuration, setLastFetchDuration] = useState(null);
+    const [showCronSettings, setShowCronSettings] = useState(false);
 
     // Debug logging helper
     const logDebug = (category, message, data = null) => {
@@ -575,19 +579,57 @@ export default function MarketAnalyzerTester() {
         }
     }, []);
 
-    // Initial fetch
-    useEffect(() => {
-        fetchMarketData();
-    }, [fetchMarketData]);
+    // Load persisted history from database on mount
+    const loadPersistedHistory = useCallback(async () => {
+        try {
+            logDebug('HISTORY', 'Loading persisted history from database...');
+            const response = await fetch('/api/history/states?limit=50');
+            if (!response.ok) {
+                logDebug('HISTORY', `Failed to load history: ${response.status}`);
+                return;
+            }
+            const result = await response.json();
+            if (result.success && result.data && result.data.length > 0) {
+                // Map database records to signalHistory format
+                const historicalSignals = result.data.map(state => {
+                    // Parse full_state_json if it exists
+                    const fullState = state.full_state_json || state;
+                    return {
+                        timestamp: new Date(state.timestamp),
+                        bias: state.bias || fullState.finalDecision?.bias || 'WAIT',
+                        confidence: state.confidence || fullState.finalDecision?.confidence || 0,
+                        scenario: fullState.exchangeDivergence?.scenario || null,
+                        regime: state.primary_regime || state.regime_state || fullState.marketRegime?.regime || null,
+                        isDemo: false,
+                        fromDatabase: true
+                    };
+                });
+                setSignalHistory(historicalSignals);
+                logDebug('HISTORY', `Loaded ${historicalSignals.length} historical signals from database`);
+            } else {
+                logDebug('HISTORY', 'No historical data found in database');
+            }
+        } catch (err) {
+            logDebug('HISTORY', `Error loading history: ${err.message}`);
+        }
+    }, []);
 
-    // Auto-refresh
+    // Initial load - ONLY load persisted history, NOT live data
+    // Live data is fetched when user clicks Refresh or enables auto-refresh
+    useEffect(() => {
+        loadPersistedHistory(); // Load history from database first
+        // fetchMarketData() - REMOVED: Don't auto-fetch on page load
+    }, [loadPersistedHistory]);
+
+    // Auto-refresh with configurable interval
     useEffect(() => {
         let interval;
-        if (autoRefresh) {
-            interval = setInterval(() => fetchMarketData(), 60000); // Every minute
+        if (autoRefresh && refreshInterval > 0) {
+            const ms = refreshInterval * 60 * 1000; // Convert minutes to ms
+            interval = setInterval(() => fetchMarketData(), ms);
         }
         return () => clearInterval(interval);
-    }, [autoRefresh, fetchMarketData]);
+    }, [autoRefresh, refreshInterval, fetchMarketData]);
 
     // Prepare chart data
     const getSignalHistoryChartData = () => {
@@ -607,6 +649,30 @@ export default function MarketAnalyzerTester() {
             { name: 'SHORT', value: short, fill: '#ef4444' },
             { name: 'WAIT', value: wait, fill: '#6b7280' }
         ];
+    };
+
+    // Export signal history to CSV
+    const exportSignalHistory = () => {
+        if (signalHistory.length === 0) return;
+
+        const headers = ['Timestamp', 'Bias', 'Confidence', 'Scenario', 'Regime', 'Source'];
+        const rows = signalHistory.map(signal => [
+            signal.timestamp instanceof Date ? signal.timestamp.toISOString() : new Date(signal.timestamp).toISOString(),
+            signal.bias || '',
+            signal.confidence?.toFixed(2) || '',
+            signal.scenario || '',
+            signal.regime || '',
+            signal.fromDatabase ? 'Database' : 'Live'
+        ]);
+
+        const csvContent = [headers.join(','), ...rows.map(row => row.join(','))].join('\n');
+        const blob = new Blob([csvContent], { type: 'text/csv' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `signal_history_${new Date().toISOString().slice(0, 10)}.csv`;
+        link.click();
+        URL.revokeObjectURL(url);
     };
 
     return (
@@ -637,19 +703,87 @@ export default function MarketAnalyzerTester() {
                                 {connectionStatus.charAt(0).toUpperCase() + connectionStatus.slice(1)}
                             </div>
 
-                            {/* Auto Refresh Toggle */}
-                            <Button
-                                variant={autoRefresh ? "default" : "outline"}
-                                size="sm"
-                                onClick={() => setAutoRefresh(!autoRefresh)}
-                                className={autoRefresh ?
-                                    "bg-purple-600 text-white" :
-                                    "border-slate-700 text-slate-400 hover:text-white"
-                                }
-                            >
-                                <Clock className="w-4 h-4 mr-2" />
-                                Auto-Refresh {autoRefresh ? 'ON' : 'OFF'}
-                            </Button>
+                            {/* Auto Refresh Control */}
+                            <div className="relative">
+                                <Button
+                                    variant={autoRefresh ? "default" : "outline"}
+                                    size="sm"
+                                    onClick={() => setShowCronSettings(!showCronSettings)}
+                                    className={autoRefresh ?
+                                        "bg-purple-600 text-white" :
+                                        "border-slate-700 text-slate-400 hover:text-white"
+                                    }
+                                >
+                                    <Clock className="w-4 h-4 mr-2" />
+                                    {autoRefresh ? `Auto ${refreshInterval}m` : 'Auto OFF'}
+                                    <ChevronDown className="w-3 h-3 ml-1" />
+                                </Button>
+
+                                {/* Cron Settings Dropdown */}
+                                {showCronSettings && (
+                                    <div className="absolute top-full right-0 mt-2 w-56 bg-slate-800 border border-slate-700 rounded-lg shadow-xl z-50">
+                                        <div className="p-3 border-b border-slate-700">
+                                            <div className="text-xs text-slate-400 uppercase mb-2">Auto-Refresh Settings</div>
+                                        </div>
+                                        <div className="p-3 space-y-3">
+                                            {/* Toggle */}
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-sm text-slate-300">Enabled</span>
+                                                <button
+                                                    onClick={() => setAutoRefresh(!autoRefresh)}
+                                                    className={`w-10 h-5 rounded-full transition-colors ${autoRefresh ? 'bg-purple-600' : 'bg-slate-600'}`}
+                                                >
+                                                    <div className={`w-4 h-4 bg-white rounded-full transition-transform ${autoRefresh ? 'translate-x-5' : 'translate-x-0.5'}`} />
+                                                </button>
+                                            </div>
+
+                                            {/* Interval Selector */}
+                                            <div>
+                                                <label className="text-xs text-slate-400 block mb-1">Refresh Interval</label>
+                                                <div className="grid grid-cols-4 gap-1">
+                                                    {[1, 2, 5, 10].map(min => (
+                                                        <button
+                                                            key={min}
+                                                            onClick={() => setRefreshInterval(min)}
+                                                            className={`px-2 py-1.5 text-xs rounded ${refreshInterval === min
+                                                                ? 'bg-purple-600 text-white'
+                                                                : 'bg-slate-700 text-slate-400 hover:bg-slate-600'
+                                                                }`}
+                                                        >
+                                                            {min}m
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            </div>
+
+                                            {/* Custom Interval */}
+                                            <div>
+                                                <label className="text-xs text-slate-400 block mb-1">Custom (minutes)</label>
+                                                <input
+                                                    type="number"
+                                                    min="1"
+                                                    max="60"
+                                                    value={refreshInterval}
+                                                    onChange={(e) => setRefreshInterval(Math.max(1, Math.min(60, parseInt(e.target.value) || 1)))}
+                                                    className="w-full px-2 py-1.5 bg-slate-900 border border-slate-700 rounded text-white text-sm"
+                                                />
+                                            </div>
+
+                                            {/* Stop Button */}
+                                            <button
+                                                onClick={() => {
+                                                    setAutoRefresh(false);
+                                                    setShowCronSettings(false);
+                                                }}
+                                                className="w-full py-2 bg-red-600/20 text-red-400 rounded text-sm hover:bg-red-600/30 flex items-center justify-center gap-2"
+                                            >
+                                                <Pause className="w-4 h-4" />
+                                                Stop Auto-Refresh
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
 
                             {/* Refresh Button */}
                             <Button
@@ -1121,7 +1255,19 @@ export default function MarketAnalyzerTester() {
                                             <Clock className="w-5 h-5 text-amber-400" />
                                             Signal Log
                                         </div>
-                                        <span className="text-sm text-slate-400 font-normal">{signalHistory.length} signals recorded</span>
+                                        <div className="flex items-center gap-3">
+                                            <span className="text-sm text-slate-400 font-normal">{signalHistory.length} signals recorded</span>
+                                            <Button
+                                                variant="outline"
+                                                size="sm"
+                                                onClick={exportSignalHistory}
+                                                disabled={signalHistory.length === 0}
+                                                className="border-slate-700 text-slate-300 hover:bg-emerald-600 hover:text-white hover:border-emerald-600 disabled:opacity-50"
+                                            >
+                                                <Download className="w-4 h-4 mr-1" />
+                                                Export
+                                            </Button>
+                                        </div>
                                     </CardTitle>
                                 </CardHeader>
                                 <CardContent>

@@ -1,8 +1,11 @@
 import React, { useState } from 'react';
 import MarketAnalyzerTester from './MarketAnalyzerTester';
 import BacktestDashboard from './BacktestDashboard';
+import ReplayBacktestPage from './ReplayBacktestPage';
 import DebugDashboard from './DebugDashboard';
-import { Brain, BarChart3, TestTube, Bug } from 'lucide-react';
+import CalibrationPanel from './CalibrationPanel';
+import AdminDataTools from './AdminDataTools';
+import { Brain, BarChart3, TestTube, Bug, History, Settings, Server } from 'lucide-react';
 
 function App() {
   const [activeView, setActiveView] = useState('tester');
@@ -47,6 +50,16 @@ function App() {
                 Backtest Lab
               </button>
               <button
+                onClick={() => setActiveView('replay')}
+                className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-medium transition-all ${activeView === 'replay'
+                  ? 'bg-gradient-to-r from-cyan-600 to-blue-600 text-white shadow-lg shadow-cyan-500/20'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-700/50'
+                  }`}
+              >
+                <History className="w-4 h-4" />
+                Replay Backtest
+              </button>
+              <button
                 onClick={() => setActiveView('debug')}
                 className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-medium transition-all ${activeView === 'debug'
                   ? 'bg-gradient-to-r from-amber-600 to-orange-600 text-white shadow-lg shadow-amber-500/20'
@@ -55,6 +68,26 @@ function App() {
               >
                 <Bug className="w-4 h-4" />
                 Debug
+              </button>
+              <button
+                onClick={() => setActiveView('calibration')}
+                className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-medium transition-all ${activeView === 'calibration'
+                  ? 'bg-gradient-to-r from-pink-600 to-rose-600 text-white shadow-lg shadow-pink-500/20'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-700/50'
+                  }`}
+              >
+                <Settings className="w-4 h-4" />
+                Calibration
+              </button>
+              <button
+                onClick={() => setActiveView('admin')}
+                className={`flex items-center gap-2 px-5 py-2.5 rounded-lg font-medium transition-all ${activeView === 'admin'
+                  ? 'bg-gradient-to-r from-purple-600 to-pink-600 text-white shadow-lg shadow-purple-500/20'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-700/50'
+                  }`}
+              >
+                <Server className="w-4 h-4" />
+                Admin
               </button>
             </div>
 
@@ -73,7 +106,10 @@ function App() {
       <div className="pt-16">
         {activeView === 'tester' && <MarketAnalyzerTester />}
         {activeView === 'backtest' && <BacktestDashboard />}
+        {activeView === 'replay' && <ReplayBacktestPage />}
         {activeView === 'debug' && <DebugDashboard />}
+        {activeView === 'calibration' && <CalibrationPanel />}
+        {activeView === 'admin' && <AdminDataTools />}
       </div>
     </div>
   );

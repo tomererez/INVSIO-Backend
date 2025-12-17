@@ -1,0 +1,1282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Backtest Improvement Cycle - INVSIO.AI</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #0a0a1a 0%, #1a1a2e 50%, #0f0f23 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+        
+        /* Tab Navigation */
+        .tab-nav {
+            display: flex;
+            background: rgba(0,0,0,0.4);
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        
+        .tab-btn {
+            padding: 18px 30px;
+            background: transparent;
+            border: none;
+            color: #888;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border-bottom: 3px solid transparent;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .tab-btn:hover {
+            color: #ccc;
+            background: rgba(255,255,255,0.05);
+        }
+        
+        .tab-btn.active {
+            color: #00d4ff;
+            border-bottom-color: #00d4ff;
+            background: rgba(0, 212, 255, 0.1);
+        }
+        
+        .tab-btn .badge {
+            background: #ef4444;
+            color: white;
+            font-size: 0.7rem;
+            padding: 2px 8px;
+            border-radius: 10px;
+        }
+        
+        .tab-content {
+            display: none;
+            padding: 40px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        h1 {
+            font-size: 2.2rem;
+            margin-bottom: 10px;
+            background: linear-gradient(90deg, #00d4ff, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .subtitle {
+            color: #888;
+            margin-bottom: 40px;
+            font-size: 1.1rem;
+        }
+        
+        /* ============ TAB 1: CYCLE OVERVIEW ============ */
+        .cycle-container {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 50px;
+            position: relative;
+        }
+        
+        .cycle-ring {
+            position: relative;
+            width: 450px;
+            height: 450px;
+        }
+        
+        .cycle-center {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 130px;
+            height: 130px;
+            background: linear-gradient(135deg, #1a1a3e, #2a2a4e);
+            border-radius: 50%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            border: 2px solid #7c3aed;
+            box-shadow: 0 0 30px rgba(124, 58, 237, 0.3);
+        }
+        
+        .cycle-center span {
+            font-size: 0.85rem;
+            color: #00d4ff;
+            font-weight: 600;
+        }
+        
+        .cycle-center .goal {
+            font-size: 0.7rem;
+            color: #888;
+            margin-top: 5px;
+            text-align: center;
+        }
+        
+        .phase {
+            position: absolute;
+            width: 100px;
+            height: 100px;
+            background: linear-gradient(135deg, #1e1e3f, #2d2d5a);
+            border-radius: 14px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .phase:hover {
+            transform: scale(1.1);
+            box-shadow: 0 0 25px rgba(0, 212, 255, 0.4);
+            border-color: #00d4ff;
+        }
+        
+        .phase-number {
+            font-size: 1.6rem;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+        
+        .phase-title {
+            font-size: 0.7rem;
+            color: #ccc;
+            line-height: 1.2;
+        }
+        
+        .phase-1 { top: 0; left: 50%; transform: translateX(-50%); }
+        .phase-2 { top: 15%; right: 8%; }
+        .phase-3 { bottom: 15%; right: 8%; }
+        .phase-4 { bottom: 0; left: 50%; transform: translateX(-50%); }
+        .phase-5 { bottom: 15%; left: 8%; }
+        .phase-6 { top: 15%; left: 8%; }
+        
+        .phase-1 .phase-number { color: #00d4ff; }
+        .phase-2 .phase-number { color: #10b981; }
+        .phase-3 .phase-number { color: #f59e0b; }
+        .phase-4 .phase-number { color: #ef4444; }
+        .phase-5 .phase-number { color: #8b5cf6; }
+        .phase-6 .phase-number { color: #ec4899; }
+        
+        .arrows-svg {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        
+        .arrow-path {
+            fill: none;
+            stroke: url(#arrowGradient);
+            stroke-width: 2;
+            stroke-dasharray: 8 4;
+            animation: flowDash 1s linear infinite;
+        }
+        
+        @keyframes flowDash {
+            to { stroke-dashoffset: -12; }
+        }
+        
+        /* Assessment Cards */
+        .assessment {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 25px;
+            margin-bottom: 40px;
+        }
+        
+        .assessment-card {
+            background: linear-gradient(135deg, rgba(30, 30, 60, 0.8), rgba(45, 45, 90, 0.6));
+            border-radius: 14px;
+            padding: 22px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .assessment-card h3 {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 18px;
+            font-size: 1.1rem;
+        }
+        
+        .icon {
+            width: 26px;
+            height: 26px;
+            border-radius: 7px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.9rem;
+        }
+        
+        .icon-good { background: rgba(16, 185, 129, 0.2); color: #10b981; }
+        .icon-warning { background: rgba(245, 158, 11, 0.2); color: #f59e0b; }
+        
+        .assessment-card ul {
+            list-style: none;
+        }
+        
+        .assessment-card li {
+            padding: 7px 0;
+            padding-left: 22px;
+            position: relative;
+            color: #bbb;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            font-size: 0.9rem;
+        }
+        
+        .assessment-card li:last-child { border-bottom: none; }
+        
+        .assessment-card li::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+        }
+        
+        .good-list li::before { background: #10b981; }
+        .warning-list li::before { background: #f59e0b; }
+        
+        /* ============ TAB 2: CHECKLIST ============ */
+        .checklist-section {
+            background: linear-gradient(135deg, rgba(30, 30, 60, 0.6), rgba(45, 45, 90, 0.4));
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 30px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .checklist-section h2 {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 25px;
+            font-size: 1.3rem;
+        }
+        
+        .checklist-section h2 .section-icon {
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.1rem;
+        }
+        
+        .priority-critical .section-icon { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+        .priority-high .section-icon { background: rgba(245, 158, 11, 0.2); color: #f59e0b; }
+        .priority-medium .section-icon { background: rgba(0, 212, 255, 0.2); color: #00d4ff; }
+        
+        .checklist-items {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        
+        .checklist-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 14px;
+            padding: 16px;
+            background: rgba(0,0,0,0.25);
+            border-radius: 10px;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+        
+        .checklist-item:hover {
+            background: rgba(0,0,0,0.35);
+        }
+        
+        .checklist-item.completed {
+            opacity: 0.5;
+        }
+        
+        .checklist-item.completed .item-title {
+            text-decoration: line-through;
+        }
+        
+        .checkbox {
+            width: 22px;
+            height: 22px;
+            border: 2px solid #555;
+            border-radius: 5px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+        
+        .checkbox.checked {
+            background: #10b981;
+            border-color: #10b981;
+        }
+        
+        .checkbox.checked::after {
+            content: '✓';
+            color: white;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+        
+        .item-content {
+            flex: 1;
+        }
+        
+        .item-title {
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 5px;
+            font-size: 0.95rem;
+        }
+        
+        .item-desc {
+            color: #888;
+            font-size: 0.85rem;
+            line-height: 1.4;
+        }
+        
+        .item-file {
+            font-family: monospace;
+            font-size: 0.75rem;
+            color: #7c3aed;
+            background: rgba(124, 58, 237, 0.15);
+            padding: 3px 8px;
+            border-radius: 4px;
+            margin-top: 8px;
+            display: inline-block;
+        }
+        
+        .progress-bar-container {
+            margin-bottom: 30px;
+        }
+        
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+        
+        .progress-label {
+            color: #888;
+            font-size: 0.9rem;
+        }
+        
+        .progress-percent {
+            color: #00d4ff;
+            font-weight: 600;
+        }
+        
+        .progress-bar {
+            height: 12px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00d4ff, #7c3aed);
+            border-radius: 6px;
+            transition: width 0.5s ease;
+        }
+        
+        /* ============ TAB 3: HOW TO USE ============ */
+        .how-to-section {
+            margin-bottom: 40px;
+        }
+        
+        .how-to-card {
+            background: linear-gradient(135deg, rgba(30, 30, 60, 0.7), rgba(45, 45, 90, 0.5));
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 25px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .how-to-card h3 {
+            color: #00d4ff;
+            margin-bottom: 20px;
+            font-size: 1.2rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .step-number {
+            width: 32px;
+            height: 32px;
+            background: linear-gradient(135deg, #7c3aed, #00d4ff);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 0.9rem;
+            flex-shrink: 0;
+        }
+        
+        .instruction-list {
+            list-style: none;
+            padding-left: 0;
+        }
+        
+        .instruction-list li {
+            padding: 12px 0;
+            padding-left: 30px;
+            position: relative;
+            color: #ccc;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        
+        .instruction-list li::before {
+            content: '→';
+            position: absolute;
+            left: 0;
+            color: #00d4ff;
+        }
+        
+        .code-block {
+            background: rgba(0,0,0,0.4);
+            border-radius: 8px;
+            padding: 15px 20px;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 0.85rem;
+            color: #10b981;
+            margin: 15px 0;
+            overflow-x: auto;
+            border-left: 3px solid #7c3aed;
+        }
+        
+        .warning-box {
+            background: rgba(245, 158, 11, 0.15);
+            border: 1px solid rgba(245, 158, 11, 0.4);
+            border-radius: 10px;
+            padding: 15px 20px;
+            margin: 15px 0;
+            display: flex;
+            gap: 12px;
+            align-items: flex-start;
+        }
+        
+        .warning-box .icon {
+            font-size: 1.2rem;
+        }
+        
+        .warning-box p {
+            color: #f59e0b;
+            font-size: 0.9rem;
+        }
+        
+        .tip-box {
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid rgba(16, 185, 129, 0.4);
+            border-radius: 10px;
+            padding: 15px 20px;
+            margin: 15px 0;
+        }
+        
+        .tip-box p {
+            color: #10b981;
+            font-size: 0.9rem;
+        }
+        
+        /* Data Analysis Section */
+        .data-insight {
+            background: linear-gradient(135deg, rgba(124, 58, 237, 0.15), rgba(0, 212, 255, 0.1));
+            border: 1px solid rgba(124, 58, 237, 0.3);
+            border-radius: 16px;
+            padding: 25px;
+            margin-top: 30px;
+        }
+        
+        .data-insight h3 {
+            color: #7c3aed;
+            margin-bottom: 20px;
+        }
+        
+        .insight-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+        }
+        
+        .insight-stat {
+            background: rgba(0,0,0,0.3);
+            padding: 18px;
+            border-radius: 10px;
+            text-align: center;
+        }
+        
+        .insight-stat .value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #fff;
+        }
+        
+        .insight-stat .label {
+            font-size: 0.8rem;
+            color: #888;
+            margin-top: 5px;
+        }
+        
+        .insight-stat.warning .value { color: #f59e0b; }
+        .insight-stat.danger .value { color: #ef4444; }
+        .insight-stat.good .value { color: #10b981; }
+        
+        /* Metrics Table */
+        .metrics-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        
+        .metrics-table th,
+        .metrics-table td {
+            padding: 12px 16px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .metrics-table th {
+            background: rgba(0,0,0,0.3);
+            color: #00d4ff;
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+        
+        .metrics-table td {
+            color: #ccc;
+            font-size: 0.9rem;
+        }
+        
+        .metrics-table tr:hover td {
+            background: rgba(255,255,255,0.03);
+        }
+        
+        .status-badge {
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        
+        .status-badge.missing {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+        }
+        
+        .status-badge.partial {
+            background: rgba(245, 158, 11, 0.2);
+            color: #f59e0b;
+        }
+        
+        .status-badge.done {
+            background: rgba(16, 185, 129, 0.2);
+            color: #10b981;
+        }
+        
+        /* ============ TAB 4: YOUR DATA ============ */
+        .data-overview {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+        
+        .data-card {
+            background: linear-gradient(135deg, rgba(30, 30, 60, 0.8), rgba(45, 45, 90, 0.6));
+            border-radius: 14px;
+            padding: 25px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .data-card h4 {
+            color: #888;
+            font-size: 0.85rem;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .data-card .big-number {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #fff;
+        }
+        
+        .data-card .sub-text {
+            color: #666;
+            font-size: 0.85rem;
+            margin-top: 5px;
+        }
+        
+        .issue-alert {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.4);
+            border-radius: 14px;
+            padding: 25px;
+            margin-bottom: 30px;
+        }
+        
+        .issue-alert h3 {
+            color: #ef4444;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .issue-list {
+            list-style: none;
+        }
+        
+        .issue-list li {
+            padding: 10px 0;
+            padding-left: 25px;
+            position: relative;
+            color: #ccc;
+            font-size: 0.9rem;
+        }
+        
+        .issue-list li::before {
+            content: '⚠';
+            position: absolute;
+            left: 0;
+        }
+        
+        .action-steps {
+            background: linear-gradient(135deg, rgba(16, 185, 129, 0.1), rgba(16, 185, 129, 0.05));
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            border-radius: 14px;
+            padding: 25px;
+        }
+        
+        .action-steps h3 {
+            color: #10b981;
+            margin-bottom: 20px;
+        }
+        
+        .action-step {
+            display: flex;
+            gap: 15px;
+            padding: 15px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 10px;
+            margin-bottom: 12px;
+        }
+        
+        .action-step:last-child {
+            margin-bottom: 0;
+        }
+        
+        .action-step .step-num {
+            width: 28px;
+            height: 28px;
+            background: #10b981;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 0.85rem;
+            flex-shrink: 0;
+            color: #000;
+        }
+        
+        .action-step .step-content h4 {
+            color: #fff;
+            margin-bottom: 5px;
+            font-size: 0.95rem;
+        }
+        
+        .action-step .step-content p {
+            color: #888;
+            font-size: 0.85rem;
+        }
+        
+        @media (max-width: 900px) {
+            .assessment,
+            .data-overview,
+            .insight-grid { grid-template-columns: 1fr; }
+            .cycle-ring { width: 320px; height: 320px; }
+            .phase { width: 75px; height: 75px; }
+        }
+    </style>
+</head>
+<body>
+    <!-- Tab Navigation -->
+    <nav class="tab-nav">
+        <button class="tab-btn active" onclick="switchTab('overview')">
+            🔄 Cycle Overview
+        </button>
+        <button class="tab-btn" onclick="switchTab('checklist')">
+            ✅ Implementation Checklist
+            <span class="badge" id="remaining-badge">14</span>
+        </button>
+        <button class="tab-btn" onclick="switchTab('howto')">
+            📖 How To Use Backtest
+        </button>
+        <button class="tab-btn" onclick="switchTab('yourdata')">
+            📊 Your Data Analysis
+        </button>
+    </nav>
+    
+    <!-- ============ TAB 1: CYCLE OVERVIEW ============ -->
+    <div id="overview" class="tab-content active">
+        <h1>Backtest Improvement Cycle</h1>
+        <p class="subtitle">Iterative process for improving market analyzer accuracy</p>
+        
+        <!-- Cycle Visualization -->
+        <div class="cycle-container">
+            <div class="cycle-ring">
+                <svg class="arrows-svg" viewBox="0 0 450 450">
+                    <defs>
+                        <linearGradient id="arrowGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                            <stop offset="0%" style="stop-color:#00d4ff;stop-opacity:0.3" />
+                            <stop offset="50%" style="stop-color:#7c3aed;stop-opacity:0.6" />
+                            <stop offset="100%" style="stop-color:#00d4ff;stop-opacity:0.3" />
+                        </linearGradient>
+                    </defs>
+                    <circle cx="225" cy="225" r="160" class="arrow-path" />
+                </svg>
+                
+                <div class="cycle-center">
+                    <span>ITERATE</span>
+                    <div class="goal">Until >57%<br/>Accuracy</div>
+                </div>
+                
+                <div class="phase phase-1">
+                    <div class="phase-number">1</div>
+                    <div class="phase-title">Run<br/>Backtest</div>
+                </div>
+                <div class="phase phase-2">
+                    <div class="phase-number">2</div>
+                    <div class="phase-title">Analyze<br/>Results</div>
+                </div>
+                <div class="phase phase-3">
+                    <div class="phase-number">3</div>
+                    <div class="phase-title">Identify<br/>Weak Spots</div>
+                </div>
+                <div class="phase phase-4">
+                    <div class="phase-number">4</div>
+                    <div class="phase-title">Modify<br/>Math</div>
+                </div>
+                <div class="phase phase-5">
+                    <div class="phase-number">5</div>
+                    <div class="phase-title">Unit<br/>Test</div>
+                </div>
+                <div class="phase phase-6">
+                    <div class="phase-number">6</div>
+                    <div class="phase-title">Re-Backtest<br/>& Compare</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Assessment Cards -->
+        <div class="assessment">
+            <div class="assessment-card">
+                <h3><span class="icon icon-good">✓</span> What's Working</h3>
+                <ul class="good-list">
+                    <li>Clear 6-phase iterative structure</li>
+                    <li>Emphasis on ONE change at a time</li>
+                    <li>Decision matrix for keep/revert</li>
+                    <li>Good file reference mapping</li>
+                    <li>Practical example included</li>
+                    <li>Metrics targets defined (>55%, >60%)</li>
+                </ul>
+            </div>
+            
+            <div class="assessment-card">
+                <h3><span class="icon icon-warning">!</span> Needs Implementation</h3>
+                <ul class="warning-list">
+                    <li>Confidence calibration check</li>
+                    <li>WAIT effectiveness metric</li>
+                    <li>Regime-specific accuracy breakdown</li>
+                    <li>Error category tracking</li>
+                    <li>Baseline documentation step</li>
+                    <li>Multi-timeframe validation</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    
+    <!-- ============ TAB 2: CHECKLIST ============ -->
+    <div id="checklist" class="tab-content">
+        <h1>Implementation Checklist</h1>
+        <p class="subtitle">Track your progress on improving the backtest system</p>
+        
+        <!-- Progress Bar -->
+        <div class="progress-bar-container">
+            <div class="progress-header">
+                <span class="progress-label">Overall Progress</span>
+                <span class="progress-percent" id="progress-percent">0%</span>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progress-fill" style="width: 0%"></div>
+            </div>
+        </div>
+        
+        <!-- CRITICAL Priority -->
+        <div class="checklist-section priority-critical">
+            <h2><span class="section-icon">🔴</span> Critical - Fix First</h2>
+            <div class="checklist-items">
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Add Outcome Labeling to Your Data</div>
+                        <div class="item-desc">Your 20 replay states have NO outcome labels (CONTINUATION/REVERSAL/NOISE). Without labels, you cannot measure accuracy.</div>
+                        <div class="item-file">Run: Label Outcomes button in Replay Backtest page</div>
+                    </div>
+                </div>
+                
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Implement Directional Accuracy Calculation</div>
+                        <div class="item-desc">Add function to calculate: when bias=LONG, did price go up? When bias=SHORT, did price go down?</div>
+                        <div class="item-file">src/backtest/scoreboardService.js</div>
+                    </div>
+                </div>
+                
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Add Confidence Calibration Check</div>
+                        <div class="item-desc">Group signals by confidence bucket (0-4, 5-6, 7-8, 9-10) and verify higher confidence = higher accuracy.</div>
+                        <div class="item-file">src/backtest/scoreboardService.js → addCalibrationMetrics()</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- HIGH Priority -->
+        <div class="checklist-section priority-high">
+            <h2><span class="section-icon">🟠</span> High Priority - Core Metrics</h2>
+            <div class="checklist-items">
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Add WAIT Effectiveness Metric</div>
+                        <div class="item-desc">Measure volatility during WAIT periods vs LONG/SHORT periods. Ratio should be >1.2 (WAIT = choppier).</div>
+                        <div class="item-file">src/backtest/scoreboardService.js → calculateWaitEffectiveness()</div>
+                    </div>
+                </div>
+                
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Implement Error Bucketing</div>
+                        <div class="item-desc">When signals fail, categorize WHY: regime_misread, cvd_misleading, structure_false, funding_miss, etc.</div>
+                        <div class="item-file">src/backtest/errorBucketing.js (new file)</div>
+                    </div>
+                </div>
+                
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Add Regime Accuracy Breakdown</div>
+                        <div class="item-desc">Track accuracy per regime: distribution, accumulation, long_trap, short_trap, healthy_bull, healthy_bear.</div>
+                        <div class="item-file">src/backtest/scoreboardService.js → calculateRegimeAccuracy()</div>
+                    </div>
+                </div>
+                
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Document Baseline Before Changes</div>
+                        <div class="item-desc">Always save current metrics before modifying math. Without "before", "after" is meaningless.</div>
+                        <div class="item-file">Create: baselines/ folder with JSON snapshots</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- MEDIUM Priority -->
+        <div class="checklist-section priority-medium">
+            <h2><span class="section-icon">🔵</span> Medium Priority - Enhanced Analysis</h2>
+            <div class="checklist-items">
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Add Multi-Timeframe Accuracy</div>
+                        <div class="item-desc">Track accuracy separately for 30m, 1h, 4h, 1d timeframes. Identify which TF is weakest.</div>
+                        <div class="item-file">src/backtest/scoreboardService.js</div>
+                    </div>
+                </div>
+                
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Track Bucket Alignment Accuracy</div>
+                        <div class="item-desc">When MACRO+MICRO+SCALPING all agree, is accuracy higher? It should be!</div>
+                        <div class="item-file">src/backtest/scoreboardService.js</div>
+                    </div>
+                </div>
+                
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Add Exchange Divergence Scenario Accuracy</div>
+                        <div class="item-desc">Which scenarios work? whale_distribution, whale_accumulation, retail_fomo - track each.</div>
+                        <div class="item-file">src/backtest/scoreboardService.js</div>
+                    </div>
+                </div>
+                
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Increase Sample Size</div>
+                        <div class="item-desc">20 states is too small for statistical significance. Target 200+ states across varied conditions.</div>
+                        <div class="item-file">Run more replay batches with different time ranges</div>
+                    </div>
+                </div>
+                
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Add MFE/MAE Analysis</div>
+                        <div class="item-desc">Track Max Favorable Excursion and Max Adverse Excursion for each signal. Shows signal quality beyond just correct/wrong.</div>
+                        <div class="item-file">src/backtest/outcomeLabelingJob.js</div>
+                    </div>
+                </div>
+                
+                <div class="checklist-item" onclick="toggleCheck(this)">
+                    <div class="checkbox"></div>
+                    <div class="item-content">
+                        <div class="item-title">Create Visual Comparison Dashboard</div>
+                        <div class="item-desc">Before/after comparison charts for each iteration. Makes improvement visible.</div>
+                        <div class="item-file">frontend/src/BacktestComparison.jsx (new)</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- ============ TAB 3: HOW TO USE ============ -->
+    <div id="howto" class="tab-content">
+        <h1>How To Use The Backtest System</h1>
+        <p class="subtitle">Step-by-step guide to validating and improving your market analyzer</p>
+        
+        <!-- Step 1 -->
+        <div class="how-to-card">
+            <h3><span class="step-number">1</span> Run a Replay Backtest</h3>
+            <ul class="instruction-list">
+                <li>Go to your <strong>Replay Backtest</strong> page in the terminal app</li>
+                <li>Select a <strong>time range</strong> - pick periods with varied market conditions (up, down, sideways)</li>
+                <li>Choose <strong>step size</strong>: 1h for macro analysis, 30m for scalping</li>
+                <li>Set <strong>horizon</strong>: MICRO = 2-8 hours, MACRO = 1-5 days</li>
+                <li>Click <strong>"Run Backtest"</strong> and wait for completion</li>
+            </ul>
+            
+            <div class="tip-box">
+                <p>💡 <strong>Tip:</strong> Start with at least 7 days of data to get meaningful patterns. Aim for 200+ snapshots.</p>
+            </div>
+        </div>
+        
+        <!-- Step 2 -->
+        <div class="how-to-card">
+            <h3><span class="step-number">2</span> Label the Outcomes</h3>
+            <ul class="instruction-list">
+                <li>After replay completes, click <strong>"Label Outcomes"</strong></li>
+                <li>This looks at what <em>actually happened</em> after each prediction</li>
+                <li>Labels: <strong>CONTINUATION</strong> (bias was right), <strong>REVERSAL</strong> (bias was wrong), <strong>NOISE</strong> (no significant move)</li>
+            </ul>
+            
+            <div class="code-block">
+// Outcome Labeling Logic (simplified)
+if (bias === "LONG" && futurePrice > currentPrice * 1.005) → CONTINUATION
+if (bias === "LONG" && futurePrice < currentPrice * 0.995) → REVERSAL
+if (priceMove < 0.5%) → NOISE
+            </div>
+            
+            <div class="warning-box">
+                <span class="icon">⚠️</span>
+                <p><strong>Your current data has NO outcome labels!</strong> You must run the labeling job before any analysis is meaningful.</p>
+            </div>
+        </div>
+        
+        <!-- Step 3 -->
+        <div class="how-to-card">
+            <h3><span class="step-number">3</span> Analyze Your Results</h3>
+            <ul class="instruction-list">
+                <li>Check <strong>Overall Accuracy</strong>: % of CONTINUATION / (CONTINUATION + REVERSAL)</li>
+                <li>Check <strong>Directional Accuracy</strong>: LONG accuracy vs SHORT accuracy</li>
+                <li>Check <strong>Confidence Calibration</strong>: Does confidence=8 beat confidence=5?</li>
+                <li>Check <strong>Regime Performance</strong>: Which regimes are failing?</li>
+            </ul>
+            
+            <table class="metrics-table">
+                <thead>
+                    <tr>
+                        <th>Metric</th>
+                        <th>Target</th>
+                        <th>Red Flag</th>
+                        <th>Your Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Overall Accuracy</td>
+                        <td>>55%</td>
+                        <td>&lt;50%</td>
+                        <td><span class="status-badge missing">No Data</span></td>
+                    </tr>
+                    <tr>
+                        <td>Directional Accuracy</td>
+                        <td>>57%</td>
+                        <td>&lt;53%</td>
+                        <td><span class="status-badge missing">No Data</span></td>
+                    </tr>
+                    <tr>
+                        <td>Confidence Correlation</td>
+                        <td>>0.3</td>
+                        <td>&lt;0 (inverted)</td>
+                        <td><span class="status-badge missing">No Data</span></td>
+                    </tr>
+                    <tr>
+                        <td>WAIT Volatility Ratio</td>
+                        <td>>1.2</td>
+                        <td>&lt;1.0</td>
+                        <td><span class="status-badge missing">No Data</span></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- Step 4 -->
+        <div class="how-to-card">
+            <h3><span class="step-number">4</span> Identify the Dominant Failure</h3>
+            <ul class="instruction-list">
+                <li>Look at your <strong>error bucketing</strong> - which category has most failures?</li>
+                <li>Pull <strong>5-10 specific examples</strong> from that category</li>
+                <li>Ask: <strong>What conditions led to this error?</strong></li>
+                <li>Propose a <strong>single fix</strong> (don't fix multiple things!)</li>
+            </ul>
+            
+            <div class="tip-box">
+                <p>💡 <strong>Key Principle:</strong> Fix ONE thing at a time. If you change multiple things, you won't know what worked.</p>
+            </div>
+        </div>
+        
+        <!-- Step 5 -->
+        <div class="how-to-card">
+            <h3><span class="step-number">5</span> Make the Change & Re-Test</h3>
+            <ul class="instruction-list">
+                <li><strong>Document baseline</strong>: Save current metrics before changing anything</li>
+                <li><strong>Make ONE change</strong>: Adjust threshold, weight, or logic</li>
+                <li><strong>Run unit tests</strong>: Make sure nothing broke</li>
+                <li><strong>Re-run backtest</strong>: Same parameters as before</li>
+                <li><strong>Compare</strong>: Did metrics improve? Did anything regress?</li>
+            </ul>
+            
+            <div class="code-block">
+// Decision Matrix
+if (overallImproved && targetFixed && !regression) → ✅ KEEP
+if (overallImproved && targetFixed && regression) → ⚠️ REVIEW TRADEOFF  
+if (!targetFixed || overallWorse) → ❌ REVERT
+            </div>
+        </div>
+        
+        <!-- Your Data Insight -->
+        <div class="data-insight">
+            <h3>📊 What Your Current Data Shows</h3>
+            <div class="insight-grid">
+                <div class="insight-stat">
+                    <div class="value">20</div>
+                    <div class="label">Total States</div>
+                </div>
+                <div class="insight-stat warning">
+                    <div class="value">95%</div>
+                    <div class="label">WAIT Signals</div>
+                </div>
+                <div class="insight-stat danger">
+                    <div class="value">0</div>
+                    <div class="label">Labeled Outcomes</div>
+                </div>
+                <div class="insight-stat">
+                    <div class="value">2.5-3.8</div>
+                    <div class="label">Confidence Range</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- ============ TAB 4: YOUR DATA ============ -->
+    <div id="yourdata" class="tab-content">
+        <h1>Your Data Analysis</h1>
+        <p class="subtitle">Based on replay_states from your database (20 rows)</p>
+        
+        <!-- Data Overview -->
+        <div class="data-overview">
+            <div class="data-card">
+                <h4>Total States</h4>
+                <div class="big-number">20</div>
+                <div class="sub-text">Need 200+ for significance</div>
+            </div>
+            <div class="data-card">
+                <h4>Bias Distribution</h4>
+                <div class="big-number">95% WAIT</div>
+                <div class="sub-text">1 SHORT, 19 WAIT</div>
+            </div>
+            <div class="data-card">
+                <h4>Avg Confidence</h4>
+                <div class="big-number">3.1</div>
+                <div class="sub-text">Range: 2.5 - 3.8</div>
+            </div>
+        </div>
+        
+        <!-- Issues Alert -->
+        <div class="issue-alert">
+            <h3>🚨 Critical Issues Found</h3>
+            <ul class="issue-list">
+                <li><strong>No Outcome Labels:</strong> All outcome_label fields are empty. You cannot calculate accuracy without labels.</li>
+                <li><strong>Too Few Directional Signals:</strong> Only 1 SHORT signal out of 20. Need more LONG/SHORT to test directional accuracy.</li>
+                <li><strong>Low Sample Size:</strong> 20 states is statistically insignificant. Need 200+ for reliable metrics.</li>
+                <li><strong>Low Confidence Scores:</strong> All confidence scores between 2.5-3.8 (low range). High-confidence behavior untested.</li>
+                <li><strong>Limited Regime Variety:</strong> Mostly "range", "unclear", "distribution". Missing: accumulation, healthy_bull, healthy_bear, traps.</li>
+            </ul>
+        </div>
+        
+        <!-- Action Steps -->
+        <div class="action-steps">
+            <h3>✅ Next Steps To Fix This</h3>
+            
+            <div class="action-step">
+                <div class="step-num">1</div>
+                <div class="step-content">
+                    <h4>Run Outcome Labeling</h4>
+                    <p>Go to Replay Backtest page → Click "Label Outcomes". This will look forward from each state and assign CONTINUATION/REVERSAL/NOISE labels.</p>
+                </div>
+            </div>
+            
+            <div class="action-step">
+                <div class="step-num">2</div>
+                <div class="step-content">
+                    <h4>Run More Backtests with Varied Time Ranges</h4>
+                    <p>Pick time ranges that include: strong bull runs, strong drops, ranging markets. This will give you variety in regimes and biases.</p>
+                </div>
+            </div>
+            
+            <div class="action-step">
+                <div class="step-num">3</div>
+                <div class="step-content">
+                    <h4>Target 200+ States</h4>
+                    <p>Run multiple batches until you have at least 200 labeled states. This gives statistical significance to your accuracy calculations.</p>
+                </div>
+            </div>
+            
+            <div class="action-step">
+                <div class="step-num">4</div>
+                <div class="step-content">
+                    <h4>Analyze Bias Distribution</h4>
+                    <p>After more data, check: Are you getting roughly equal LONG/SHORT/WAIT? 95% WAIT might indicate overly conservative thresholds.</p>
+                </div>
+            </div>
+            
+            <div class="action-step">
+                <div class="step-num">5</div>
+                <div class="step-content">
+                    <h4>Calculate Initial Metrics</h4>
+                    <p>Once you have 200+ labeled states: calculate directional accuracy, confidence calibration, regime accuracy. This is your baseline.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Tab switching
+        function switchTab(tabId) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(tabId).classList.add('active');
+            event.currentTarget.classList.add('active');
+        }
+        
+        // Checklist functionality
+        function toggleCheck(item) {
+            const checkbox = item.querySelector('.checkbox');
+            checkbox.classList.toggle('checked');
+            item.classList.toggle('completed');
+            updateProgress();
+            saveChecklistState();
+        }
+        
+        function updateProgress() {
+            const total = document.querySelectorAll('.checklist-item').length;
+            const completed = document.querySelectorAll('.checklist-item.completed').length;
+            const percent = Math.round((completed / total) * 100);
+            
+            document.getElementById('progress-percent').textContent = percent + '%';
+            document.getElementById('progress-fill').style.width = percent + '%';
+            document.getElementById('remaining-badge').textContent = total - completed;
+        }
+        
+        function saveChecklistState() {
+            const items = document.querySelectorAll('.checklist-item');
+            const state = [];
+            items.forEach((item, index) => {
+                state.push(item.classList.contains('completed'));
+            });
+            localStorage.setItem('invsio-checklist', JSON.stringify(state));
+        }
+        
+        function loadChecklistState() {
+            const saved = localStorage.getItem('invsio-checklist');
+            if (saved) {
+                const state = JSON.parse(saved);
+                const items = document.querySelectorAll('.checklist-item');
+                items.forEach((item, index) => {
+                    if (state[index]) {
+                        item.classList.add('completed');
+                        item.querySelector('.checkbox').classList.add('checked');
+                    }
+                });
+            }
+            updateProgress();
+        }
+        
+        // Initialize
+        document.addEventListener('DOMContentLoaded', loadChecklistState);
+    </script>
+</body>
+</html>

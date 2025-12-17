@@ -8,7 +8,7 @@ const logger = winston.createLogger({
     winston.format.splat(),
     winston.format.json()
   ),
-  defaultMeta: { service: 'smartrading-backend' },
+  defaultMeta: { service: 'invsio-backend' },
   transports: [
     // Write all logs with importance level of `error` or less to `error.log`
     new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
